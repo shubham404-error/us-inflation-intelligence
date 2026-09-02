@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 from data import DATA_CUTOFF, build_dataset, data_quality, latest_metrics
-from model import FED_TARGET, build_forecast
+from model import FED_TARGET, build_forecast, run_research_validation
 from ai import ask_gemini, default_brief
 
 
@@ -153,8 +153,13 @@ def load_data():
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def load_forecast(data: pd.DataFrame):
-    return build_forecast(data)
+def load_forecast(data: pd.DataFrame, validation_metrics: pd.DataFrame | None = None):
+    return build_forecast(data, validation_metrics)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_research_validation(data: pd.DataFrame):
+    return run_research_validation(data)
 
 
 def fmt_pct(value) -> str:
@@ -313,6 +318,13 @@ def render_forecast(result):
     st.dataframe(display, use_container_width=True, hide_index=True)
 
     st.markdown("### Model validation")
+    if st.button("Run research backtest", use_container_width=True):
+        with st.spinner("Running rolling-origin validation. This can take a while the first time..."):
+            validation = load_research_validation(st.session_state["inflation_data"])
+            st.session_state["validation_metrics"] = validation
+            st.session_state["forecast_result"] = load_forecast(st.session_state["inflation_data"], validation)
+            st.rerun()
+
     metrics = result.metrics.copy()
     metrics["MAE"] = metrics["MAE"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "—")
     metrics["RMSE"] = metrics["RMSE"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "—")
@@ -321,12 +333,10 @@ def render_forecast(result):
 
     cal = result.calibration
     coverage = cal["empirical_coverage"]
-    st.info(
-        f"80% conformal target coverage: {coverage:.1%} on {cal['n']} walk-forward 3M forecasts. "
-        f"Calibration radius: {cal['radius']:.2f} percentage points."
-        if pd.notna(coverage)
-        else "Not enough walk-forward forecasts for coverage diagnostics."
-    )
+    if pd.notna(coverage):
+        st.info(f"80% calibration target. Empirical coverage: {coverage:.1%}.")
+    else:
+        st.info("Prediction intervals are provisional until the research backtest is run.")
 
 
 def render_drivers(result):
@@ -432,7 +442,12 @@ def main():
         bundle = load_data()
         data = bundle.data
         status = bundle.status
-        result = load_forecast(data)
+        st.session_state["inflation_data"] = data
+        validation = st.session_state.get("validation_metrics")
+        result = st.session_state.get("forecast_result")
+        if result is None:
+            result = load_forecast(data, validation)
+            st.session_state["forecast_result"] = result
     except Exception as exc:
         st.error(str(exc))
         st.stop()
