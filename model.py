@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 import pandas as pd
+
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from xgboost import XGBRegressor
 
+
+# ============================================================
+# SETTINGS
+# ============================================================
 
 TARGET = "pce_inflation"
 
@@ -26,340 +29,1015 @@ FEATURES = [
 ]
 
 
-def _feature_frame(data: pd.DataFrame) -> pd.DataFrame:
-    df = data[FEATURES].copy()
+# ============================================================
+# DATA NORMALIZATION
+# ============================================================
 
-    for col in FEATURES:
-        for lag in (1, 3, 6, 12):
-            df[f"{col}_lag{lag}"] = df[col].shift(lag)
+def normalize_columns(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make the model independent of whether an older version of the
+    data pipeline produced FRED IDs or friendly internal names.
+    """
 
-    return df.dropna()
+    df = data.copy()
+
+    aliases = {
+        "PCEPI": "pcepi",
+        "PCEPILFE": "core_pce",
+        "CUSR0000SAH1": "shelter",
+        "UNRATE": "unemployment",
+        "DPCERA3M086SBEA": "real_consumption",
+        "MICH": "inflation_expectations",
+        "WTISPLC": "oil",
+    }
+
+    for fred_name, internal_name in aliases.items():
+
+        if internal_name not in df.columns and fred_name in df.columns:
+            df[internal_name] = df[fred_name]
+
+    # Create derived variables if they are missing.
+    if "pce_inflation" not in df.columns and "pcepi" in df.columns:
+        df["pce_inflation"] = (
+            df["pcepi"].pct_change(12) * 100
+        )
+
+    if (
+        "core_pce_inflation" not in df.columns
+        and "core_pce" in df.columns
+    ):
+        df["core_pce_inflation"] = (
+            df["core_pce"].pct_change(12) * 100
+        )
+
+    if (
+        "shelter_inflation" not in df.columns
+        and "shelter" in df.columns
+    ):
+        df["shelter_inflation"] = (
+            df["shelter"].pct_change(12) * 100
+        )
+
+    if (
+        "consumption_growth" not in df.columns
+        and "real_consumption" in df.columns
+    ):
+        df["consumption_growth"] = (
+            df["real_consumption"].pct_change(12) * 100
+        )
+
+    if (
+        "oil_yoy" not in df.columns
+        and "oil" in df.columns
+    ):
+        df["oil_yoy"] = (
+            df["oil"].pct_change(12) * 100
+        )
+
+    if (
+        "oil_3m" not in df.columns
+        and "oil" in df.columns
+    ):
+        df["oil_3m"] = (
+            df["oil"].pct_change(3) * 100
+        )
+
+    if (
+        "expectations_change" not in df.columns
+        and "inflation_expectations" in df.columns
+    ):
+        df["expectations_change"] = (
+            df["inflation_expectations"].diff(3)
+        )
+
+    if (
+        "unemployment_change" not in df.columns
+        and "unemployment" in df.columns
+    ):
+        df["unemployment_change"] = (
+            df["unemployment"].diff(3)
+        )
+
+    return df
 
 
-def _fit_xgb(X: pd.DataFrame, y: pd.Series) -> XGBRegressor:
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def validate_model_data(
+    data: pd.DataFrame,
+) -> None:
+
+    required = FEATURES
+
+    missing = [
+        col
+        for col in required
+        if col not in data.columns
+    ]
+
+    if missing:
+        raise KeyError(
+            "Forecasting data is missing required columns: "
+            + ", ".join(missing)
+            + ". Available columns: "
+            + ", ".join(map(str, data.columns))
+        )
+
+
+# ============================================================
+# SUPERVISED DATA
+# ============================================================
+
+def supervised_frame(
+    data: pd.DataFrame,
+    horizon: int,
+):
+    df = normalize_columns(data)
+
+    validate_model_data(df)
+
+    feature_data = df[FEATURES].copy()
+
+    X = pd.DataFrame(
+        index=feature_data.index
+    )
+
+    # IMPORTANT:
+    # Every predictor is lagged.
+    # This prevents current-period information
+    # from leaking into the prediction.
+    for column in FEATURES:
+
+        for lag in [1, 3, 6, 12]:
+
+            X[
+                f"{column}_lag{lag}"
+            ] = feature_data[column].shift(lag)
+
+    # Future target.
+    y = df[TARGET].shift(-horizon)
+
+    combined = pd.concat(
+        [
+            X,
+            y.rename("target"),
+        ],
+        axis=1,
+    ).dropna()
+
+    if len(combined) < 80:
+        raise RuntimeError(
+            "Not enough observations after feature engineering."
+        )
+
+    X_final = combined.drop(
+        columns=["target"]
+    )
+
+    y_final = combined["target"]
+
+    return X_final, y_final
+
+
+# ============================================================
+# XGBOOST
+# ============================================================
+
+def fit_xgb(
+    X: pd.DataFrame,
+    y: pd.Series,
+) -> XGBRegressor:
+
     model = XGBRegressor(
         n_estimators=350,
         max_depth=3,
         learning_rate=0.035,
         subsample=0.85,
-        colsample_bytree=0.8,
+        colsample_bytree=0.80,
         objective="reg:squarederror",
         random_state=42,
         n_jobs=2,
     )
-    model.fit(X, y)
+
+    model.fit(
+        X,
+        y,
+    )
+
     return model
 
 
-def _walk_forward_xgb(data: pd.DataFrame, min_train: int = 120) -> tuple[pd.Series, pd.Series]:
-    df = _feature_frame(data)
-    y = data.loc[df.index, TARGET]
+# ============================================================
+# XGBOOST WALK-FORWARD
+# ============================================================
 
-    preds = []
-    actuals = []
+def walk_forward_xgb(
+    data: pd.DataFrame,
+    horizon: int,
+    min_train: int = 120,
+):
+
+    X, y = supervised_frame(
+        data,
+        horizon=horizon,
+    )
+
+    if len(X) <= min_train:
+        raise RuntimeError(
+            f"Not enough observations for {horizon}-month XGBoost validation."
+        )
+
+    actual = []
+    predicted = []
     dates = []
 
-    for i in range(min_train, len(df)):
-        X_train = df.iloc[:i]
+    for i in range(
+        min_train,
+        len(X),
+    ):
+
+        X_train = X.iloc[:i]
         y_train = y.iloc[:i]
-        X_test = df.iloc[[i]]
 
-        model = _fit_xgb(X_train, y_train)
-        pred = float(model.predict(X_test)[0])
+        X_test = X.iloc[[i]]
 
-        preds.append(pred)
-        actuals.append(float(y.iloc[i]))
-        dates.append(df.index[i])
+        model = fit_xgb(
+            X_train,
+            y_train,
+        )
+
+        prediction = float(
+            model.predict(X_test)[0]
+        )
+
+        actual.append(
+            float(y.iloc[i])
+        )
+
+        predicted.append(
+            prediction
+        )
+
+        dates.append(
+            X.index[i]
+        )
 
     return (
-        pd.Series(actuals, index=dates, name="actual"),
-        pd.Series(preds, index=dates, name="xgb"),
+        pd.Series(
+            actual,
+            index=dates,
+            name="actual",
+        ),
+        pd.Series(
+            predicted,
+            index=dates,
+            name="prediction",
+        ),
     )
 
 
-def _walk_forward_sarimax(data: pd.DataFrame, min_train: int = 120) -> tuple[pd.Series, pd.Series]:
-    series = data[TARGET].dropna()
+# ============================================================
+# SARIMAX WALK-FORWARD
+# ============================================================
 
-    # Keep the SARIMAX benchmark deliberately simple.
-    preds = []
-    actuals = []
+def walk_forward_sarimax(
+    data: pd.DataFrame,
+    horizon: int,
+    min_train: int = 120,
+):
+
+    df = normalize_columns(data)
+
+    if TARGET not in df.columns:
+        raise KeyError(
+            "PCE inflation target not found."
+        )
+
+    y = (
+        df[TARGET]
+        .dropna()
+    )
+
+    actual = []
+    predicted = []
     dates = []
 
-    for i in range(min_train, len(series)):
-        train = series.iloc[:i]
-        test_date = series.index[i]
+    for i in range(
+        min_train,
+        len(y) - horizon + 1,
+    ):
+
+        train = y.iloc[:i]
 
         model = SARIMAX(
             train,
             order=(1, 0, 1),
-            seasonal_order=(1, 0, 1, 12),
+            seasonal_order=(
+                1,
+                0,
+                1,
+                12,
+            ),
             trend="c",
             enforce_stationarity=False,
             enforce_invertibility=False,
         )
-        fitted = model.fit(disp=False)
-        pred = float(fitted.forecast(1).iloc[0])
 
-        preds.append(pred)
-        actuals.append(float(series.iloc[i]))
-        dates.append(test_date)
+        fitted = model.fit(
+            disp=False
+        )
+
+        forecast = fitted.forecast(
+            steps=horizon
+        )
+
+        target_date = y.index[
+            i + horizon - 1
+        ]
+
+        actual.append(
+            float(
+                y.iloc[
+                    i + horizon - 1
+                ]
+            )
+        )
+
+        predicted.append(
+            float(
+                forecast.iloc[-1]
+            )
+        )
+
+        dates.append(
+            target_date
+        )
 
     return (
-        pd.Series(actuals, index=dates, name="actual"),
-        pd.Series(preds, index=dates, name="sarimax"),
+        pd.Series(
+            actual,
+            index=dates,
+            name="actual",
+        ),
+        pd.Series(
+            predicted,
+            index=dates,
+            name="prediction",
+        ),
     )
 
 
-def _metrics(actual: pd.Series, predicted: pd.Series) -> dict:
-    aligned = pd.concat([actual, predicted], axis=1).dropna()
+# ============================================================
+# METRICS
+# ============================================================
+
+def calculate_metrics(
+    actual: pd.Series,
+    predicted: pd.Series,
+):
+
+    df = pd.concat(
+        [actual, predicted],
+        axis=1,
+    ).dropna()
+
     return {
-        "MAE": mean_absolute_error(aligned.iloc[:, 0], aligned.iloc[:, 1]),
-        "RMSE": np.sqrt(mean_squared_error(aligned.iloc[:, 0], aligned.iloc[:, 1])),
-        "Bias": float((aligned.iloc[:, 1] - aligned.iloc[:, 0]).mean()),
+        "MAE": float(
+            mean_absolute_error(
+                df.iloc[:, 0],
+                df.iloc[:, 1],
+            )
+        ),
+        "RMSE": float(
+            np.sqrt(
+                mean_squared_error(
+                    df.iloc[:, 0],
+                    df.iloc[:, 1],
+                )
+            )
+        ),
+        "Bias": float(
+            (
+                df.iloc[:, 1]
+                - df.iloc[:, 0]
+            ).mean()
+        ),
     }
 
 
-def _temporal_conformal_interval(actual: pd.Series, predicted: pd.Series, point: float) -> tuple[float, float]:
-    residuals = (actual - predicted).dropna().abs().tail(60)
+# ============================================================
+# CONFORMAL PREDICTION
+# ============================================================
 
-    if len(residuals) < 20:
-        fallback = float(residuals.std() * 1.64) if len(residuals) else 0.75
-        return point - fallback, point + fallback
+def conformal_radius(
+    actual: pd.Series,
+    predicted: pd.Series,
+    coverage: float = 0.80,
+):
 
-    # Approximate 80% finite-sample conformal quantile.
-    q = float(residuals.quantile(0.80, interpolation="higher"))
-    return point - q, point + q
+    residuals = (
+        actual
+        .sub(predicted)
+        .abs()
+        .dropna()
+        .tail(60)
+    )
+
+    if residuals.empty:
+        return 0.75
+
+    return float(
+        residuals.quantile(
+            coverage,
+            interpolation="higher",
+        )
+    )
 
 
-def _pressure_score(row: pd.Series) -> int:
+# ============================================================
+# PRESSURE SCORE
+# ============================================================
+
+def calculate_pressure_score(
+    row: pd.Series,
+) -> int:
+
     score = 50
 
     if row["pce_inflation"] > 3:
         score += 10
+
     if row["core_pce_inflation"] > 3:
         score += 8
+
     if row["shelter_inflation"] > 4:
         score += 7
+
     if row["oil_yoy"] > 10:
         score += 7
+
     if row["inflation_expectations"] > 3:
         score += 5
+
     if row["unemployment"] < 4.5:
         score += 5
 
-    return max(0, min(100, score))
+    return max(
+        0,
+        min(
+            100,
+            score,
+        ),
+    )
 
 
-def _regime(data: pd.DataFrame) -> str:
-    row = data.dropna(subset=["pce_inflation"]).iloc[-1]
-    momentum = data["pce_inflation"].dropna().diff(3).iloc[-1]
+# ============================================================
+# REGIME
+# ============================================================
 
-    if row["pce_inflation"] < 2.5 and momentum <= 0:
+def detect_regime(
+    data: pd.DataFrame,
+) -> str:
+
+    df = normalize_columns(data)
+
+    target = (
+        df[TARGET]
+        .dropna()
+    )
+
+    latest = target.iloc[-1]
+
+    momentum = (
+        target.diff(3)
+        .iloc[-1]
+    )
+
+    if (
+        latest < 2.5
+        and momentum <= 0
+    ):
         return "Low / Disinflationary"
-    if row["pce_inflation"] >= 3.5 and momentum > 0:
+
+    if (
+        latest >= 3.5
+        and momentum > 0
+    ):
         return "Reflationary"
+
     return "Stable"
 
 
-def build_forecasts(data: pd.DataFrame) -> dict:
-    xgb_actual, xgb_pred = _walk_forward_xgb(data)
-    sar_actual, sar_pred = _walk_forward_sarimax(data)
+# ============================================================
+# MAIN FORECAST FUNCTION
+# ============================================================
 
-    # Choose the better validated model.
-    scores = {
-        "XGBoost": _metrics(xgb_actual, xgb_pred),
-        "SARIMAX": _metrics(sar_actual, sar_pred),
+def build_forecasts(
+    data: pd.DataFrame,
+) -> dict:
+
+    df = normalize_columns(data)
+
+    validate_model_data(df)
+
+    # --------------------------------------------------------
+    # 3 MONTH VALIDATION
+    # --------------------------------------------------------
+
+    xgb_actual_3, xgb_pred_3 = (
+        walk_forward_xgb(
+            df,
+            horizon=3,
+        )
+    )
+
+    sar_actual_3, sar_pred_3 = (
+        walk_forward_sarimax(
+            df,
+            horizon=3,
+        )
+    )
+
+    xgb_metrics = calculate_metrics(
+        xgb_actual_3,
+        xgb_pred_3,
+    )
+
+    sar_metrics = calculate_metrics(
+        sar_actual_3,
+        sar_pred_3,
+    )
+
+    metrics = {
+        "XGBoost": xgb_metrics,
+        "SARIMAX": sar_metrics,
     }
-    selected_model = min(scores, key=lambda name: scores[name]["MAE"])
 
-    if selected_model == "XGBoost":
-        train_df = _feature_frame(data)
-        target = data.loc[train_df.index, TARGET]
-        final_model = _fit_xgb(train_df, target)
-        latest_features = train_df.iloc[[-1]]
-        point_3m = float(final_model.predict(latest_features)[0])
+    selected_model = min(
+        metrics,
+        key=lambda name: metrics[name]["MAE"],
+    )
 
-        # For a genuine 3-month recursive forecast, approximate by recursively
-        # extending the target using the trained model. The initial version keeps
-        # the feature set deliberately compact; this is replaced by a dedicated
-        # multi-step pipeline in the next milestone.
-        point_6m = point_3m
-        lower, upper = _temporal_conformal_interval(xgb_actual, xgb_pred, point_3m)
+    # --------------------------------------------------------
+    # FINAL 3M XGBOOST
+    # --------------------------------------------------------
 
-        xgb_features = train_df.columns.tolist()
-        importances = pd.Series(final_model.feature_importances_, index=xgb_features)
-        importances = importances.sort_values(ascending=False).head(8)
+    X3, y3 = supervised_frame(
+        df,
+        horizon=3,
+    )
+
+    final_xgb_3 = fit_xgb(
+        X3,
+        y3,
+    )
+
+    point_3m = float(
+        final_xgb_3.predict(
+            X3.iloc[[-1]]
+        )[0]
+    )
+
+    radius_3m = conformal_radius(
+        xgb_actual_3,
+        xgb_pred_3,
+        coverage=0.80,
+    )
+
+    # --------------------------------------------------------
+    # FINAL 6M XGBOOST
+    # --------------------------------------------------------
+
+    X6, y6 = supervised_frame(
+        df,
+        horizon=6,
+    )
+
+    final_xgb_6 = fit_xgb(
+        X6,
+        y6,
+    )
+
+    point_6m = float(
+        final_xgb_6.predict(
+            X6.iloc[[-1]]
+        )[0]
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANCE
+    # --------------------------------------------------------
+
+    importance = (
+        pd.Series(
+            final_xgb_3.feature_importances_,
+            index=X3.columns,
+        )
+        .sort_values(
+            ascending=False
+        )
+        .head(8)
+    )
+
+    drivers = []
+
+    for feature, value in importance.items():
+
+        friendly = (
+            feature
+            .replace(
+                "_lag1",
+                " lag 1",
+            )
+            .replace(
+                "_lag3",
+                " lag 3",
+            )
+            .replace(
+                "_lag6",
+                " lag 6",
+            )
+            .replace(
+                "_lag12",
+                " lag 12",
+            )
+            .replace(
+                "_",
+                " ",
+            )
+        )
+
+        drivers.append(
+            (
+                friendly,
+                float(value),
+            )
+        )
+
+    # --------------------------------------------------------
+    # LATEST OBSERVATION
+    # --------------------------------------------------------
+
+    target_data = df.dropna(
+        subset=[TARGET]
+    )
+
+    latest = target_data.iloc[-1]
+
+    pressure = calculate_pressure_score(
+        latest
+    )
+
+    regime = detect_regime(
+        df
+    )
+
+    if metrics[selected_model]["MAE"] < 0.35:
+        confidence = "High"
+
+    elif metrics[selected_model]["MAE"] < 0.55:
+        confidence = "Medium"
 
     else:
-        target = data[TARGET].dropna()
-        sar_model = SARIMAX(
-            target,
-            order=(1, 0, 1),
-            seasonal_order=(1, 0, 1, 12),
-            trend="c",
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-        ).fit(disp=False)
-        fc = sar_model.get_forecast(steps=6)
-        mean = fc.predicted_mean
-        ci = fc.conf_int(alpha=0.20)
+        confidence = "Low"
 
-        point_3m = float(mean.iloc[2])
-        point_6m = float(mean.iloc[5])
-        lower = float(ci.iloc[2, 0])
-        upper = float(ci.iloc[2, 1])
-        importances = pd.Series(dtype=float)
+    # --------------------------------------------------------
+    # HISTORY + FORECAST CHART
+    # --------------------------------------------------------
 
-    latest = data.dropna(subset=[TARGET]).iloc[-1]
-    pressure = _pressure_score(latest)
-    regime = _regime(data)
-
-    confidence = "High" if scores[selected_model]["MAE"] < 0.35 else ("Medium" if scores[selected_model]["MAE"] < 0.55 else "Low")
-
-    # Forecast visualization: use model residual calibration for the selected point forecast.
-    chart_history = data[[TARGET]].dropna().tail(72).copy()
-    future_idx = pd.date_range(chart_history.index[-1] + pd.offsets.MonthBegin(1), periods=3, freq="MS")
-
-    lower_path = np.linspace(lower, lower, len(future_idx))
-    upper_path = np.linspace(upper, upper, len(future_idx))
-    forecast_path = np.linspace(float(latest[TARGET]), point_3m, len(future_idx))
-
-    chart_df = pd.DataFrame(index=future_idx)
-    chart_df["forecast"] = forecast_path
-    chart_df["lower"] = lower_path
-    chart_df["upper"] = upper_path
-    chart_df["pce_inflation"] = np.nan
-    chart_df["forecast_index"] = chart_df.index
-
-    history = chart_history.rename(columns={TARGET: "pce_inflation"})
-    combined = pd.concat([history, chart_df], axis=0)
-    combined["forecast_index"] = combined.index
-
-    top_drivers = importances
-    if top_drivers.empty:
-        top_drivers = pd.Series(
-            {
-                "PCE persistence": 1.0,
-                "Core PCE": 0.8,
-                "Shelter": 0.7,
-                "Oil": 0.6,
+    history = (
+        target_data[
+            [TARGET]
+        ]
+        .tail(84)
+        .rename(
+            columns={
+                TARGET:
+                "pce_inflation"
             }
         )
-
-    driver_names = []
-    for name in top_drivers.index:
-        friendly = (
-            name.replace("_lag1", " lag 1")
-            .replace("_lag3", " lag 3")
-            .replace("_lag6", " lag 6")
-            .replace("_lag12", " lag 12")
-            .replace("_", " ")
-        )
-        driver_names.append((friendly, float(top_drivers[name])))
-
-    macro_brief = (
-        f"The model's primary 3-month PCE forecast is {point_3m:.2f}%, "
-        f"which is {point_3m - 2:+.2f} percentage points versus the Fed's 2% objective. "
-        f"Current inflation is classified as {regime.lower()}, with an inflation-pressure "
-        f"score of {pressure}/100. The forecast should be read together with its prediction "
-        f"range of {lower:.2f}% to {upper:.2f}%. The model is most influenced by recent inflation "
-        f"persistence and the selected macro drivers. This is a research-model assessment, not an official Fed forecast."
     )
+
+    future_dates = pd.date_range(
+        history.index[-1]
+        + pd.offsets.MonthBegin(1),
+        periods=6,
+        freq="MS",
+    )
+
+    forecast_values = np.concatenate(
+        [
+            np.linspace(
+                float(latest[TARGET]),
+                point_3m,
+                3,
+            ),
+            np.linspace(
+                point_3m,
+                point_6m,
+                3,
+            ),
+        ]
+    )
+
+    chart_future = pd.DataFrame(
+        {
+            "pce_inflation": np.nan,
+            "forecast": forecast_values,
+            "lower": (
+                forecast_values
+                - radius_3m
+            ),
+            "upper": (
+                forecast_values
+                + radius_3m
+            ),
+        },
+        index=future_dates,
+    )
+
+    chart_history = history.copy()
+
+    chart_history[
+        "forecast"
+    ] = np.nan
+
+    chart_history[
+        "lower"
+    ] = np.nan
+
+    chart_history[
+        "upper"
+    ] = np.nan
+
+    chart_df = pd.concat(
+        [
+            chart_history,
+            chart_future,
+        ]
+    )
+
+    # --------------------------------------------------------
+    # FORECAST TABLE
+    # --------------------------------------------------------
 
     forecast_table = pd.DataFrame(
         [
-            ["Current", latest[TARGET], np.nan, np.nan],
-            ["3M", point_3m, lower, upper],
-            ["6M", point_6m, np.nan, np.nan],
+            [
+                "Current",
+                float(latest[TARGET]),
+                np.nan,
+                np.nan,
+            ],
+            [
+                "3M",
+                point_3m,
+                point_3m - radius_3m,
+                point_3m + radius_3m,
+            ],
+            [
+                "6M",
+                point_6m,
+                np.nan,
+                np.nan,
+            ],
         ],
-        columns=["Horizon", "Forecast", "Lower", "Upper"],
+        columns=[
+            "Horizon",
+            "Forecast",
+            "Lower",
+            "Upper",
+        ],
     )
 
-    regime_history = data[[TARGET]].dropna().copy()
-    regime_history["regime"] = [
-        "Low / Disinflationary" if x < 2.5 else ("Reflationary" if x >= 3.5 else "Stable")
-        for x in regime_history[TARGET]
-    ]
+    # --------------------------------------------------------
+    # REGIME HISTORY
+    # --------------------------------------------------------
+
+    regime_history = target_data[
+        [TARGET]
+    ].copy()
+
+    momentum = (
+        regime_history[TARGET]
+        .diff(3)
+    )
+
+    regime_history[
+        "regime"
+    ] = np.select(
+        [
+            (
+                (
+                    regime_history[TARGET]
+                    < 2.5
+                )
+                & (
+                    momentum <= 0
+                )
+            ),
+            (
+                (
+                    regime_history[TARGET]
+                    >= 3.5
+                )
+                & (
+                    momentum > 0
+                )
+            ),
+        ],
+        [
+            "Low / Disinflationary",
+            "Reflationary",
+        ],
+        default="Stable",
+    )
+
+    # --------------------------------------------------------
+    # BRIEF
+    # --------------------------------------------------------
+
+    brief = (
+        f"The model forecasts PCE inflation at "
+        f"{point_3m:.2f}% in three months and "
+        f"{point_6m:.2f}% in six months. "
+        f"The 3M forecast is "
+        f"{point_3m - 2:+.2f} percentage points "
+        f"from the Federal Reserve's 2% objective. "
+        f"The current inflation environment is "
+        f"{regime.lower()}, with an inflation-pressure "
+        f"score of {pressure}/100. "
+        f"The 80% XGBoost prediction range is "
+        f"{point_3m - radius_3m:.2f}% to "
+        f"{point_3m + radius_3m:.2f}%, based on "
+        f"temporal conformal calibration of historical "
+        f"walk-forward errors."
+    )
 
     return {
         "selected_model": selected_model,
         "point_forecast_3m": point_3m,
         "point_forecast_6m": point_6m,
-        "lower_3m": lower,
-        "upper_3m": upper,
+        "lower_3m": point_3m - radius_3m,
+        "upper_3m": point_3m + radius_3m,
         "pressure_score": pressure,
         "regime": regime,
         "confidence": confidence,
-        "macro_brief": macro_brief,
-        "chart_df": combined,
+        "macro_brief": brief,
+        "chart_df": chart_df,
         "forecast_table": forecast_table,
-        "xgb_drivers": driver_names,
+        "xgb_drivers": drivers,
         "regime_history": regime_history,
-        "raw_metrics": scores,
-        "xgb_actual": xgb_actual,
-        "xgb_pred": xgb_pred,
-        "sar_actual": sar_actual,
-        "sar_pred": sar_pred,
+        "raw_metrics": metrics,
+        "xgb_actual": xgb_actual_3,
+        "xgb_pred": xgb_pred_3,
+        "sar_actual": sar_actual_3,
+        "sar_pred": sar_pred_3,
     }
 
 
-def model_diagnostics(forecasts: dict) -> dict:
-    rows = []
-    for name, metric in forecasts["raw_metrics"].items():
-        rows.append(
+# ============================================================
+# DIAGNOSTICS
+# ============================================================
+
+def model_diagnostics(
+    forecasts: dict,
+) -> dict:
+
+    performance = pd.DataFrame(
+        [
             {
-                "Model": name,
-                "MAE": round(metric["MAE"], 4),
-                "RMSE": round(metric["RMSE"], 4),
-                "Bias": round(metric["Bias"], 4),
+                "Model": model_name,
+                "MAE": round(
+                    metric["MAE"],
+                    4,
+                ),
+                "RMSE": round(
+                    metric["RMSE"],
+                    4,
+                ),
+                "Bias": round(
+                    metric["Bias"],
+                    4,
+                ),
             }
+            for model_name, metric
+            in forecasts["raw_metrics"].items()
+        ]
+    ).sort_values(
+        "MAE"
+    )
+
+    actual = forecasts[
+        "xgb_actual"
+    ]
+
+    predicted = forecasts[
+        "xgb_pred"
+    ]
+
+    residuals = (
+        actual
+        - predicted
+    ).dropna()
+
+    coverage_results = []
+
+    for i in range(
+        20,
+        len(residuals),
+    ):
+
+        calibration = residuals.iloc[
+            max(0, i - 60):i
+        ].abs()
+
+        q = calibration.quantile(
+            0.80,
+            interpolation="higher",
         )
 
-    performance = pd.DataFrame(rows).sort_values("MAE")
+        coverage_results.append(
+            abs(
+                residuals.iloc[i]
+            ) <= q
+        )
 
-    actual = forecasts["xgb_actual"]
-    pred = forecasts["xgb_pred"]
-    residuals = (actual - pred).dropna()
-
-    # Empirical coverage of the 80% conformal interval using a trailing residual scale.
-    cover = []
-    for i in range(20, len(residuals)):
-        calibration = residuals.iloc[max(0, i - 60):i].abs()
-        q = calibration.quantile(0.80, interpolation="higher")
-        cover.append(abs(residuals.iloc[i]) <= q)
+    empirical_coverage = (
+        f"{100 * np.mean(coverage_results):.1f}%"
+        if coverage_results
+        else "N/A"
+    )
 
     coverage = pd.DataFrame(
         [
             {
                 "Model": "XGBoost",
                 "Target coverage": "80%",
-                "Empirical coverage": f"{100 * np.mean(cover):.1f}%" if cover else "N/A",
-                "Calibration": "Temporal conformal",
+                "Empirical coverage":
+                    empirical_coverage,
+                "Calibration":
+                    "Temporal conformal",
             }
         ]
     )
 
-    return {"performance": performance, "coverage": coverage}
+    return {
+        "performance": performance,
+        "coverage": coverage,
+    }
 
 
-def driver_table(forecasts: dict) -> pd.DataFrame:
-    drivers = forecasts["xgb_drivers"][:6]
+# ============================================================
+# DRIVER TABLE
+# ============================================================
+
+def driver_table(
+    forecasts: dict,
+) -> pd.DataFrame:
+
+    drivers = forecasts[
+        "xgb_drivers"
+    ]
+
     if not drivers:
-        drivers = [
-            ("PCE persistence", 1.0),
-            ("Core PCE", 0.8),
-            ("Shelter", 0.7),
-        ]
+        return pd.DataFrame(
+            columns=[
+                "Driver",
+                "Model importance",
+            ]
+        )
 
-    max_value = max(v for _, v in drivers)
+    max_value = max(
+        value
+        for _, value
+        in drivers
+    )
+
     rows = []
+
     for name, value in drivers:
+
         rows.append(
             {
                 "Driver": name.title(),
-                "Model importance": round(value, 4),
-                "Relative strength": round(value / max_value, 2),
+                "Model importance":
+                    round(
+                        value,
+                        4,
+                    ),
+                "Relative strength":
+                    round(
+                        value / max_value,
+                        2,
+                    )
+                    if max_value
+                    else 0,
             }
         )
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(
+        rows
+    )
