@@ -100,10 +100,17 @@ def _safe_sarimax(train: pd.Series, steps: int) -> Tuple[np.ndarray, np.ndarray]
 def _fit_direct_xgb(data: pd.DataFrame, horizon: int):
     features = _feature_frame(data)
     y = data[TARGET].shift(-horizon)
-    frame = pd.concat([features, y.rename("y")], axis=1).dropna()
+    frame = pd.concat([features, y.rename("y")], axis=1).dropna(subset=["y"])
+
+    # Keep the complete feature schema. Tree models can handle missing predictor values,
+    # and dropping columns from the prediction row creates XGBoost feature-name mismatches.
+    X = frame[features.columns]
+    valid = X.notna().any(axis=1)
+    X = X.loc[valid]
+    y_fit = frame.loc[valid, "y"]
 
     model = _xgb_model()
-    model.fit(frame.drop(columns=["y"]), frame["y"])
+    model.fit(X, y_fit)
     return model, features
 
 
@@ -132,13 +139,12 @@ def _walk_forward_xgb(data: pd.DataFrame, horizon: int, min_train: int = 96) -> 
         if forecast_date not in features.index:
             continue
 
-        row = features.loc[[forecast_date]].dropna(axis=1, how="all")
-        common = [c for c in fit.drop(columns=["y"]).columns if c in row.columns]
-        row = row.reindex(columns=common)
+        train_cols = list(fit.drop(columns=["y"]).columns)
+        row = features.loc[[forecast_date]].reindex(columns=train_cols)
 
-        if row.isna().any().any():
-            continue
-
+        # Preserve the exact training schema. XGBoost and HistGradientBoosting both
+        # support missing predictor values, so unavailable latest macro inputs do not
+        # delete columns and break the feature contract.
         pred = float(model.predict(row)[0])
         actual = float(target.loc[forecast_date])
 
