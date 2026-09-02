@@ -4,6 +4,7 @@ import os
 
 import plotly.graph_objects as go
 import streamlit as st
+from dotenv import load_dotenv
 
 from data import (
     DATA_CUTOFF,
@@ -17,10 +18,7 @@ from model import (
     model_diagnostics,
 )
 
-
-# ============================================================
-# PAGE
-# ============================================================
+load_dotenv()
 
 st.set_page_config(
     page_title="US Inflation Intelligence",
@@ -29,465 +27,246 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-
-# ============================================================
-# THEME
-# ============================================================
-
 st.markdown(
     """
     <style>
-
-    /* -------------------------------------------------------
-       BASE
-       ------------------------------------------------------- */
-
     .stApp {
-        background: #0b0f14;
-        color: #e8edf3;
+        background:#0b0f14;
+        color:#e8edf3;
     }
-
     .main .block-container {
-        max-width: 1520px;
-        padding-top: 4.3rem !important;
-        padding-bottom: 2rem !important;
-        padding-left: 1.6rem !important;
-        padding-right: 1.6rem !important;
+        max-width:1520px;
+        padding-top:4.5rem !important;
+        padding-bottom:2rem !important;
+        padding-left:1.5rem !important;
+        padding-right:1.5rem !important;
     }
-
     [data-testid="stHeader"] {
-        background: #0b0f14 !important;
-        border-bottom: 1px solid #27303b !important;
+        background:#0b0f14 !important;
+        border-bottom:1px solid #27303b !important;
     }
-
-    [data-testid="stToolbar"] {
-        background: #0b0f14 !important;
-    }
-
-    /* -------------------------------------------------------
-       NAVIGATION
-       ------------------------------------------------------- */
-
     .brand {
-        font-size: 1.25rem;
-        font-weight: 800;
-        letter-spacing: .04em;
-        color: #f3b340;
-        margin-bottom: .05rem;
+        color:#f3b340;
+        font-size:1.2rem;
+        font-weight:800;
+        letter-spacing:.04em;
     }
-
     .brand-sub {
-        font-size: .68rem;
-        letter-spacing: .14em;
-        color: #778494;
-        text-transform: uppercase;
+        color:#748191;
+        font-size:.65rem;
+        letter-spacing:.14em;
+        text-transform:uppercase;
     }
-
-    .nav-wrap {
-        border-top: 1px solid #27303b;
-        border-bottom: 1px solid #27303b;
-        padding: .4rem 0;
-        margin: .7rem 0 .8rem;
-    }
-
-    /* -------------------------------------------------------
-       TYPOGRAPHY
-       ------------------------------------------------------- */
-
-    .eyebrow {
-        color: #798697;
-        font-size: .68rem;
-        letter-spacing: .13em;
-        text-transform: uppercase;
-        font-weight: 700;
-    }
-
     .page-title {
-        font-size: 1.9rem;
-        line-height: 1.1;
-        font-weight: 750;
-        color: #f4f7fa;
-        margin-top: .15rem;
+        color:#f4f7fa;
+        font-size:1.85rem;
+        font-weight:750;
+        margin-top:.15rem;
     }
-
+    .eyebrow,.section-label {
+        color:#96a3b2;
+        font-size:.68rem;
+        letter-spacing:.13em;
+        text-transform:uppercase;
+        font-weight:800;
+    }
     .page-subtitle {
-        color: #8b98a8;
-        font-size: .83rem;
-        margin-top: .25rem;
+        color:#8b98a8;
+        font-size:.82rem;
+        margin:.2rem 0 .85rem;
     }
-
     .terminal-line {
-        font-size: .72rem;
-        color: #697686;
-        padding: .45rem 0;
-        border-bottom: 1px solid #27303b;
-        margin-bottom: .9rem;
+        color:#697686;
+        font-size:.7rem;
+        padding:.5rem 0;
+        border-top:1px solid #27303b;
+        border-bottom:1px solid #27303b;
+        margin-bottom:.9rem;
     }
-
-    .section-label {
-        font-size: .68rem;
-        font-weight: 800;
-        letter-spacing: .13em;
-        color: #9aa7b6;
-        text-transform: uppercase;
-        margin: .9rem 0 .45rem;
-    }
-
-    /* -------------------------------------------------------
-       KPI
-       ------------------------------------------------------- */
-
     div[data-testid="stMetric"] {
-        background: #111720;
-        border: 1px solid #29333f;
-        border-radius: 3px;
-        min-height: 104px;
-        padding: .65rem .75rem;
+        background:#111720;
+        border:1px solid #29333f;
+        border-radius:3px;
+        min-height:100px;
+        padding:.65rem .75rem;
     }
-
     div[data-testid="stMetricLabel"] {
-        color: #8d99a7 !important;
-        font-size: .71rem !important;
+        color:#8996a5 !important;
+        font-size:.7rem !important;
     }
-
     div[data-testid="stMetricValue"] {
-        color: #f3f6f9 !important;
-        font-size: 1.42rem !important;
+        color:#f3f6f9 !important;
+        font-size:1.4rem !important;
     }
-
-    div[data-testid="stMetricDelta"] {
-        font-size: .69rem !important;
-    }
-
-    /* -------------------------------------------------------
-       BUTTON NAV
-       ------------------------------------------------------- */
-
     .stButton > button {
-        width: 100%;
-        background: #10161e;
-        border: 1px solid #2b3541;
-        color: #aeb9c7;
-        border-radius: 3px;
-        min-height: 2rem;
-        font-size: .7rem;
-        letter-spacing: .08em;
-        font-weight: 700;
+        background:#10161e;
+        border:1px solid #2b3541;
+        color:#aeb9c7;
+        border-radius:3px;
+        font-size:.68rem;
+        font-weight:700;
+        letter-spacing:.08em;
     }
-
     .stButton > button:hover {
-        border-color: #7b8898;
-        color: #ffffff;
-        background: #151c25;
+        background:#151c25;
+        border-color:#6d7b8c;
+        color:#fff;
     }
-
-    /* -------------------------------------------------------
-       TABLES / ALERTS
-       ------------------------------------------------------- */
-
     [data-testid="stDataFrame"] {
-        border: 1px solid #29333f;
-        border-radius: 3px;
+        border:1px solid #29333f;
+        border-radius:3px;
     }
-
-    .stAlert {
-        border-radius: 3px;
-    }
-
-    /* -------------------------------------------------------
-       FOOTER
-       ------------------------------------------------------- */
-
     .footer {
-        border-top: 1px solid #27303b;
-        margin-top: 1.2rem;
-        padding-top: .65rem;
-        font-size: .65rem;
-        color: #657281;
+        color:#657281;
+        font-size:.64rem;
+        border-top:1px solid #27303b;
+        padding-top:.6rem;
+        margin-top:1rem;
     }
-
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def set_page(name: str) -> None:
-    st.session_state["page"] = name
-
-
 if "page" not in st.session_state:
     st.session_state["page"] = "Overview"
 
 
-# ============================================================
-# HEADER
-# ============================================================
+def go(page: str):
+    st.session_state["page"] = page
 
-header_left, header_right = st.columns(
-    [2.8, 1.2]
-)
 
-with header_left:
+# Header
+h1, h2 = st.columns([3, 1])
+with h1:
     st.markdown(
-        '<div class="brand">US INFLATION INTELLIGENCE</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
+        '<div class="brand">US INFLATION INTELLIGENCE</div>'
         '<div class="brand-sub">Macro Research Terminal</div>',
         unsafe_allow_html=True,
     )
-
-with header_right:
+with h2:
     st.markdown(
-        '<div style="text-align:right;color:#7d8997;font-size:.68rem;padding-top:.35rem;">'
-        'DATA VINTAGE&nbsp;&nbsp;'
-        f'<span style="color:#f3b340;">{DATA_CUTOFF}</span>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-
-# ============================================================
-# TOP NAV
-# ============================================================
-
-st.markdown(
-    '<div class="nav-wrap"></div>',
-    unsafe_allow_html=True,
-)
-
-nav = st.columns(4)
-
-pages = [
-    ("Overview", "OVERVIEW"),
-    ("Forecast", "FORECAST"),
-    ("Drivers", "DRIVERS"),
-    ("Data", "DATA"),
-]
-
-for col, (internal, label) in zip(
-    nav,
-    pages,
-):
-    with col:
-        if st.button(
-            label,
-            key=f"nav_{internal}",
-        ):
-            set_page(internal)
-            st.rerun()
-
-
-# ============================================================
-# API
-# ============================================================
-
-if not os.getenv("FRED_API_KEY"):
-    st.error(
-        "FRED_API_KEY is missing. Add it under "
-        "Streamlit Cloud → Settings → Secrets."
-    )
-    st.stop()
-
-
-# ============================================================
-# DATA
-# ============================================================
-
-@st.cache_data(
-    ttl=3600,
-    show_spinner=False,
-)
-def load_data():
-    return fetch_model_data()
-
-
-try:
-    with st.spinner("Updating economic data..."):
-        data = load_data()
-except Exception as exc:
-    st.error(
-        f"Data pipeline failed: {exc}"
-    )
-    st.stop()
-
-
-# ============================================================
-# REFRESH
-# ============================================================
-
-refresh_col, status_col = st.columns(
-    [1, 5]
-)
-
-with refresh_col:
-    if st.button(
-        "REFRESH DATA",
-        key="refresh_data",
-    ):
-        load_data.clear()
-        st.rerun()
-
-with status_col:
-    st.markdown(
-        f'<div class="terminal-line">'
-        f'WINDOW {START_DATE} → {DATA_CUTOFF}'
-        f'&nbsp;&nbsp;|&nbsp;&nbsp;'
-        f'{len(data):,} MONTHLY ROWS'
-        f'&nbsp;&nbsp;|&nbsp;&nbsp;'
-        f'FRED API ONLINE'
+        f'<div style="text-align:right;color:#7d8997;font-size:.67rem;">'
+        f'DATA VINTAGE<br><span style="color:#f3b340;">{DATA_CUTOFF}</span>'
         f'</div>',
         unsafe_allow_html=True,
     )
 
+nav = st.columns(4)
+for col, name in zip(
+    nav,
+    ["Overview", "Forecast", "Drivers", "Data"],
+):
+    with col:
+        if st.button(
+            name.upper(),
+            key=f"nav_{name}",
+            use_container_width=True,
+        ):
+            go(name)
+            st.rerun()
 
-# ============================================================
-# FORECAST ENGINE
-# ============================================================
-
-@st.cache_data(
-    ttl=3600,
-    show_spinner=False,
+st.markdown(
+    f'<div class="terminal-line">'
+    f'WINDOW {START_DATE} → {DATA_CUTOFF}'
+    f' &nbsp;|&nbsp; FRED API'
+    f' &nbsp;|&nbsp; MODEL SCHEMA 0.5'
+    f'</div>',
+    unsafe_allow_html=True,
 )
+
+if not os.getenv("FRED_API_KEY"):
+    st.error(
+        "FRED_API_KEY is missing. Add it under Streamlit Cloud → Settings → Secrets."
+    )
+    st.stop()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_data():
+    return fetch_model_data()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def run_models(frame):
-    result = build_forecasts(
+    return build_forecasts(
         frame,
         fast_mode=True,
     )
-    return result
 
+
+if st.button("REFRESH DATA", key="refresh"):
+    load_data.clear()
+    run_models.clear()
+    st.rerun()
 
 try:
-    with st.spinner(
-        "Running inflation models..."
-    ):
-        forecasts = run_models(
-            data
-        )
+    data = load_data()
 except Exception as exc:
-    st.error(
-        "Forecasting pipeline failed."
-    )
+    st.error(f"Data pipeline failed: {exc}")
+    st.stop()
+
+try:
+    forecasts = run_models(data)
+except Exception as exc:
+    st.error("Forecasting pipeline failed.")
     st.exception(exc)
     st.stop()
 
 
-# ============================================================
-# COMMON CURRENT STATE
-# ============================================================
-
-target = data.dropna(
-    subset=["pce_inflation"]
-)
-
-latest = target.iloc[-1]
-latest_date = target.index[-1]
-
-current_pce = float(
-    latest["pce_inflation"]
-)
-
-current_core = float(
-    latest["core_pce_inflation"]
-)
-
-# ============================================================
+# ------------------------------------------------------------
 # OVERVIEW
-# ============================================================
+# ------------------------------------------------------------
 
 if st.session_state["page"] == "Overview":
 
     st.markdown(
-        '<div class="eyebrow">US MACRO · PCE INFLATION</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        '<div class="page-title">Inflation at a glance</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
+        '<div class="eyebrow">US MACRO · PCE INFLATION</div>'
+        '<div class="page-title">Inflation at a glance</div>'
         '<div class="page-subtitle">'
         "Where is inflation heading, what is driving it, and how far is it from 2%?"
         '</div>',
         unsafe_allow_html=True,
     )
 
-    st.markdown(
-        f'<div class="terminal-line">'
-        f'LATEST OBSERVATION {latest_date.strftime("%b %Y")}'
-        f'&nbsp;&nbsp;|&nbsp;&nbsp;'
-        f'PRIMARY FORECAST {forecasts["point_forecast_3m"]:.2f}% / 3M'
-        f'&nbsp;&nbsp;|&nbsp;&nbsp;'
-        f'CURRENT REGIME {forecasts["regime"].upper()}'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+    latest = data.dropna(
+        subset=["pce_inflation", "core_pce_inflation"]
+    ).iloc[-1]
 
-    # KPI row
+    current_pce = float(latest["pce_inflation"])
+    current_core = float(latest["core_pce_inflation"])
+
     c1, c2, c3, c4, c5, c6 = st.columns(6)
 
-    c1.metric(
-        "PCE",
-        f"{current_pce:.2f}%",
-    )
-
-    c2.metric(
-        "Core PCE",
-        f"{current_core:.2f}%",
-    )
-
-    c3.metric(
-        "Fed Target",
-        "2.00%",
-    )
-
+    c1.metric("PCE", f"{current_pce:.2f}%")
+    c2.metric("Core PCE", f"{current_core:.2f}%")
+    c3.metric("Fed Target", "2.00%")
     c4.metric(
         "3M Forecast",
         f'{forecasts["point_forecast_3m"]:.2f}%',
         f'{forecasts["point_forecast_3m"] - current_pce:+.2f} pp',
     )
-
     c5.metric(
         "6M Forecast",
         f'{forecasts["point_forecast_6m"]:.2f}%',
     )
-
     c6.metric(
         "Pressure",
         f'{forecasts["pressure_score"]}/100',
         forecasts["confidence"],
     )
 
-    left, right = st.columns(
-        [2.25, 1]
-    )
+    left, right = st.columns([2.3, 1])
 
-    # Main chart
     with left:
-
         st.markdown(
-            '<div class="section-label">'
-            'PCE · ACTUAL / FORECAST'
-            '</div>',
+            '<div class="section-label">PCE · ACTUAL / FORECAST</div>',
             unsafe_allow_html=True,
         )
 
         chart = forecasts["chart_df"]
-
-        history = chart[
-            chart["pce_inflation"].notna()
-        ]
-
-        future = chart[
-            chart["forecast"].notna()
-        ]
+        history = chart[chart["pce_inflation"].notna()]
+        future = chart[chart["forecast"].notna()]
 
         fig = go.Figure()
 
@@ -495,11 +274,11 @@ if st.session_state["page"] == "Overview":
             go.Scatter(
                 x=history.index,
                 y=history["pce_inflation"],
-                mode="lines",
                 name="Actual",
+                mode="lines",
                 line=dict(
                     color="#f3b340",
-                    width=2.4,
+                    width=2.3,
                 ),
             )
         )
@@ -508,8 +287,8 @@ if st.session_state["page"] == "Overview":
             go.Scatter(
                 x=future.index,
                 y=future["forecast"],
-                mode="lines",
                 name="Forecast",
+                mode="lines",
                 line=dict(
                     color="#55a7ff",
                     width=2.2,
@@ -522,9 +301,7 @@ if st.session_state["page"] == "Overview":
                 x=future.index,
                 y=future["upper"],
                 mode="lines",
-                line=dict(
-                    width=0,
-                ),
+                line=dict(width=0),
                 showlegend=False,
                 hoverinfo="skip",
             )
@@ -536,48 +313,35 @@ if st.session_state["page"] == "Overview":
                 y=future["lower"],
                 mode="lines",
                 fill="tonexty",
-                fillcolor="rgba(85,167,255,0.10)",
-                line=dict(
-                    width=0,
-                ),
-                name="80% range",
+                fillcolor="rgba(85,167,255,.10)",
+                line=dict(width=0),
+                name="Prediction range",
             )
         )
 
         fig.add_hline(
-            y=2.0,
+            y=2,
             line_dash="dot",
-            line_color="#747f8d",
+            line_color="#727e8d",
             annotation_text="Fed 2%",
-            annotation_position="top left",
         )
 
         fig.update_layout(
-            height=440,
-            margin=dict(
-                l=10,
-                r=10,
-                t=10,
-                b=10,
-            ),
+            height=450,
+            margin=dict(l=10, r=10, t=10, b=10),
             paper_bgcolor="#0b0f14",
             plot_bgcolor="#0b0f14",
-            font=dict(
-                color="#cbd4de"
-            ),
+            font=dict(color="#cbd4de"),
             hovermode="x unified",
             legend=dict(
                 orientation="h",
-                y=1.03,
+                y=1.04,
                 x=0,
             ),
-            xaxis=dict(
-                showgrid=False,
-            ),
+            xaxis=dict(showgrid=False),
             yaxis=dict(
                 title="% YoY",
                 gridcolor="#1c2530",
-                zeroline=False,
             ),
         )
 
@@ -587,26 +351,21 @@ if st.session_state["page"] == "Overview":
         )
 
     with right:
-
         st.markdown(
-            '<div class="section-label">'
-            'CURRENT STATE'
-            '</div>',
+            '<div class="section-label">CURRENT STATE</div>',
             unsafe_allow_html=True,
         )
 
         st.metric(
-            "Inflation Regime",
+            "Regime",
             forecasts["regime"],
         )
-
         st.metric(
             "Distance to 2%",
             f'{forecasts["point_forecast_3m"] - 2:+.2f} pp',
         )
-
         st.metric(
-            "Model Confidence",
+            "Confidence",
             forecasts["confidence"],
         )
 
@@ -615,98 +374,41 @@ if st.session_state["page"] == "Overview":
             unsafe_allow_html=True,
         )
 
-        # Model mix is calculated safely from the forecast object.
-        weights = forecasts.get(
-            "ensemble_weights",
-            {"XGBoost": 0.50, "SARIMAX": 0.50},
-        )
-
-        xgb_weight = float(
-            weights.get("XGBoost", 0.50)
-        )
-
-        sarimax_weight = float(
-            weights.get("SARIMAX", 0.50)
-        )
-
+        weights = forecasts["ensemble_weights"]
         st.write(
-            f"XGBoost  **{xgb_weight:.0%}**"
+            f'XGBoost&nbsp;&nbsp; **{weights["XGBoost"]:.0%}**',
+            unsafe_allow_html=True,
         )
-
         st.write(
-            f"SARIMAX  **{sarimax_weight:.0%}**"
+            f'SARIMAX&nbsp;&nbsp; **{weights["SARIMAX"]:.0%}**',
+            unsafe_allow_html=True,
         )
 
     st.markdown(
         '<div class="section-label">RESEARCH VIEW</div>',
         unsafe_allow_html=True,
     )
-
-    st.info(
-        forecasts["macro_brief"]
-    )
+    st.info(forecasts["macro_brief"])
 
 
-# ============================================================
+# ------------------------------------------------------------
 # FORECAST
-# ============================================================
+# ------------------------------------------------------------
 
 elif st.session_state["page"] == "Forecast":
 
     st.markdown(
-        '<div class="eyebrow">FORECAST ENGINE</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        '<div class="page-title">Forward inflation path</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
+        '<div class="eyebrow">FORECAST ENGINE</div>'
+        '<div class="page-title">Forward inflation path</div>'
         '<div class="page-subtitle">'
-        "Direct 1–6 month forecasts from a compact econometric + ML ensemble."
+        "Direct monthly forecasts with an econometric + machine-learning ensemble."
         '</div>',
         unsafe_allow_html=True,
     )
 
-    table = forecasts[
-        "forecast_table"
-    ].copy()
-
-    table["Forecast"] = table[
-        "Forecast"
-    ].round(2)
-
-    table["Lower"] = table[
-        "Lower"
-    ].round(2)
-
-    table["Upper"] = table[
-        "Upper"
-    ].round(2)
-
-    st.markdown(
-        '<div class="section-label">FORECAST CURVE</div>',
-        unsafe_allow_html=True,
-    )
-
-    fc1, fc2, fc3 = st.columns(3)
-
-    fc1.metric(
-        "1M",
-        f'{table.iloc[0]["Forecast"]:.2f}%',
-    )
-
-    fc2.metric(
-        "3M",
-        f'{table.iloc[2]["Forecast"]:.2f}%',
-    )
-
-    fc3.metric(
-        "6M",
-        f'{table.iloc[5]["Forecast"]:.2f}%',
-    )
+    table = forecasts["forecast_table"].copy()
+    for col in ["Forecast", "Lower", "Upper"]:
+        table[col] = table[col].round(2)
 
     st.dataframe(
         table,
@@ -719,10 +421,9 @@ elif st.session_state["page"] == "Forecast":
     )
 
     st.markdown(
-        '<div class="section-label">MODEL PERFORMANCE · 24M CHRONOLOGICAL HOLDOUT</div>',
+        '<div class="section-label">MODEL PERFORMANCE · CHRONOLOGICAL HOLDOUT</div>',
         unsafe_allow_html=True,
     )
-
     st.dataframe(
         diagnostics["performance"],
         use_container_width=True,
@@ -733,7 +434,6 @@ elif st.session_state["page"] == "Forecast":
         '<div class="section-label">UNCERTAINTY CALIBRATION</div>',
         unsafe_allow_html=True,
     )
-
     st.dataframe(
         diagnostics["coverage"],
         use_container_width=True,
@@ -741,30 +441,22 @@ elif st.session_state["page"] == "Forecast":
     )
 
     st.caption(
-        "XGBoost prediction ranges use temporal conformal calibration. "
-        "They are prediction intervals, not confidence intervals."
+        "XGBoost uncertainty uses temporal conformal calibration. "
+        "Prediction intervals are not confidence intervals."
     )
 
 
-# ============================================================
+# ------------------------------------------------------------
 # DRIVERS
-# ============================================================
+# ------------------------------------------------------------
 
 elif st.session_state["page"] == "Drivers":
 
     st.markdown(
-        '<div class="eyebrow">MODEL EXPLAINABILITY</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        '<div class="page-title">What is driving the forecast?</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
+        '<div class="eyebrow">EXPLAINABILITY</div>'
+        '<div class="page-title">What is driving the forecast?</div>'
         '<div class="page-subtitle">'
-        "Feature importance from the primary 3-month XGBoost model."
+        "The strongest features used by the 3-month XGBoost model."
         '</div>',
         unsafe_allow_html=True,
     )
@@ -774,16 +466,14 @@ elif st.session_state["page"] == "Drivers":
     )
 
     left, right = st.columns(
-        [1.3, 1]
+        [1.35, 1]
     )
 
     with left:
-
         st.markdown(
             '<div class="section-label">MODEL IMPORTANCE</div>',
             unsafe_allow_html=True,
         )
-
         st.dataframe(
             drivers,
             use_container_width=True,
@@ -791,7 +481,6 @@ elif st.session_state["page"] == "Drivers":
         )
 
         if not drivers.empty:
-
             plot = drivers.sort_values(
                 "Importance"
             )
@@ -806,7 +495,7 @@ elif st.session_state["page"] == "Drivers":
             )
 
             fig.update_layout(
-                height=420,
+                height=380,
                 margin=dict(
                     l=5,
                     r=5,
@@ -815,16 +504,12 @@ elif st.session_state["page"] == "Drivers":
                 ),
                 paper_bgcolor="#0b0f14",
                 plot_bgcolor="#0b0f14",
-                font=dict(
-                    color="#cbd4de"
-                ),
+                font=dict(color="#cbd4de"),
                 xaxis=dict(
-                    title="Relative model importance",
+                    title="Relative importance",
                     gridcolor="#1c2530",
                 ),
-                yaxis=dict(
-                    showgrid=False
-                ),
+                yaxis=dict(showgrid=False),
             )
 
             st.plotly_chart(
@@ -833,7 +518,6 @@ elif st.session_state["page"] == "Drivers":
             )
 
     with right:
-
         st.markdown(
             '<div class="section-label">INFLATION REGIME</div>',
             unsafe_allow_html=True,
@@ -859,14 +543,14 @@ elif st.session_state["page"] == "Drivers":
         )
 
         fig.add_hline(
-            y=2.0,
+            y=2,
             line_dash="dot",
-            line_color="#747f8d",
+            line_color="#727e8d",
             annotation_text="Fed 2%",
         )
 
         fig.update_layout(
-            height=340,
+            height=350,
             margin=dict(
                 l=5,
                 r=5,
@@ -875,12 +559,8 @@ elif st.session_state["page"] == "Drivers":
             ),
             paper_bgcolor="#0b0f14",
             plot_bgcolor="#0b0f14",
-            font=dict(
-                color="#cbd4de"
-            ),
-            xaxis=dict(
-                showgrid=False
-            ),
+            font=dict(color="#cbd4de"),
+            xaxis=dict(showgrid=False),
             yaxis=dict(
                 title="% YoY",
                 gridcolor="#1c2530",
@@ -896,58 +576,38 @@ elif st.session_state["page"] == "Drivers":
             f"""
             **Current environment:** {forecasts["regime"]}
 
-            **Pressure score:** {forecasts["pressure_score"]}/100
+            **Inflation pressure:** {forecasts["pressure_score"]}/100
 
-            **Model confidence:** {forecasts["confidence"]}
+            **Confidence:** {forecasts["confidence"]}
             """
         )
 
         st.caption(
-            "Driver importance is model-based and does not establish economic causality."
+            "Model importance describes model behavior. It does not prove causality."
         )
 
 
-# ============================================================
+# ------------------------------------------------------------
 # DATA
-# ============================================================
+# ------------------------------------------------------------
 
 elif st.session_state["page"] == "Data":
 
     st.markdown(
-        '<div class="eyebrow">DATA & PROVENANCE</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        '<div class="page-title">Data foundation</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
+        '<div class="eyebrow">DATA & PROVENANCE</div>'
+        '<div class="page-title">Data foundation</div>'
         '<div class="page-subtitle">'
-        "Small, transparent data universe used by the forecast engine."
+        "The small set of public economic series used by the model."
         '</div>',
         unsafe_allow_html=True,
     )
 
-    status = latest_status(
-        data
-    )
-
-    st.markdown(
-        '<div class="section-label">SOURCE STATUS</div>',
-        unsafe_allow_html=True,
-    )
+    status = latest_status(data)
 
     st.dataframe(
         status,
         use_container_width=True,
         hide_index=True,
-    )
-
-    st.markdown(
-        '<div class="section-label">DATASET</div>',
-        unsafe_allow_html=True,
     )
 
     c1, c2, c3 = st.columns(3)
@@ -956,46 +616,36 @@ elif st.session_state["page"] == "Data":
         "Rows",
         f"{len(data):,}",
     )
-
     c2.metric(
         "Columns",
         f"{len(data.columns):,}",
     )
-
     c3.metric(
-        "Latest PCE",
-        latest_date.strftime("%b %Y"),
+        "Latest",
+        data.index[-1].strftime("%b %Y"),
     )
 
     st.download_button(
         "DOWNLOAD PROCESSED DATA",
-        data=data.to_csv().encode(
-            "utf-8"
-        ),
+        data=data.to_csv().encode("utf-8"),
         file_name="us_inflation_data.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
-    st.markdown(
-        '<div class="section-label">RAW MODEL DATA</div>',
-        unsafe_allow_html=True,
-    )
+    with st.expander(
+        "View recent model data"
+    ):
+        st.dataframe(
+            data.tail(24),
+            use_container_width=True,
+        )
 
-    st.dataframe(
-        data.tail(24),
-        use_container_width=True,
-    )
-
-
-# ============================================================
-# FOOTER
-# ============================================================
 
 st.markdown(
     '<div class="footer">'
-    'US Inflation Intelligence · Research / portfolio tool · '
-    'Not an official Federal Reserve forecast or investment advice.'
-    '</div>',
+    "US Inflation Intelligence · Research / portfolio tool · "
+    "Not an official Federal Reserve forecast or investment advice."
+    "</div>",
     unsafe_allow_html=True,
 )
