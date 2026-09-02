@@ -615,13 +615,26 @@ if st.session_state["page"] == "Overview":
             unsafe_allow_html=True,
         )
 
-        w = forecasts["ensemble_weights"]
+        # Model mix is calculated safely from the forecast object.
+        weights = forecasts.get(
+            "ensemble_weights",
+            {"XGBoost": 0.50, "SARIMAX": 0.50},
+        )
+
+        xgb_weight = float(
+            weights.get("XGBoost", 0.50)
+        )
+
+        sarimax_weight = float(
+            weights.get("SARIMAX", 0.50)
+        )
 
         st.write(
-            f"XGBoost  **{w['XGBoost']:.0%}**"
+            f"XGBoost  **{xgb_weight:.0%}**"
         )
+
         st.write(
-            f"SARIMAX  **{w['SARIMAX']:.0%}**"
+            f"SARIMAX  **{sarimax_weight:.0%}**"
         )
 
     st.markdown(
