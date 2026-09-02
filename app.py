@@ -1,845 +1,1263 @@
 from __future__ import annotations
 
-import os
+import hashlib
+from typing import Dict, Tuple
 
-import plotly.graph_objects as go
-import streamlit as st
-from dotenv import load_dotenv
-
-from data import DATA_CUTOFF, START_DATE, fetch_model_data
-from model import build_forecasts, driver_table, model_diagnostics
-
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-load_dotenv()
-
-st.set_page_config(
-    page_title="US Inflation Intelligence",
-    page_icon="●",
-    layout="wide",
-)
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from xgboost import XGBRegressor
 
 
 # ============================================================
-# STYLE
+# SETTINGS
 # ============================================================
 
-st.markdown(
+TARGET = "pce_inflation"
+
+FEATURES = [
+    "pce_inflation",
+    "core_pce_inflation",
+    "shelter_inflation",
+    "unemployment",
+    "unemployment_change",
+    "consumption_growth",
+    "oil_yoy",
+    "oil_3m",
+    "inflation_expectations",
+    "expectations_change",
+]
+
+FED_TARGET = 2.0
+
+
+# ============================================================
+# INTERNAL CACHE
+# ============================================================
+
+_MODEL_CACHE: Dict[str, dict] = {}
+
+
+def _data_key(data: pd.DataFrame) -> str:
     """
-    <style>
+    Create a lightweight cache key from the latest data state.
+    This prevents retraining every time Streamlit reruns.
+    """
 
-    /* =========================================================
-       GLOBAL LAYOUT
-       ========================================================= */
+    recent = data.tail(24).copy()
 
-    .stApp {
-        background-color: #0b0f14;
-        color: #e8edf3;
-    }
+    raw = pd.util.hash_pandas_object(
+        recent,
+        index=True,
+    ).values.tobytes()
 
-    /* Reserve space below Streamlit's top ribbon */
-    .main .block-container {
-        max-width: 1500px;
-        padding-top: 5.5rem !important;
-        padding-bottom: 2.5rem !important;
-        padding-left: 2rem !important;
-        padding-right: 2rem !important;
-    }
-
-    /* Prevent content from sitting underneath the header */
-    [data-testid="stAppViewContainer"] {
-        padding-top: 0 !important;
-    }
-
-    /* =========================================================
-       STREAMLIT TOP HEADER
-       ========================================================= */
-
-    [data-testid="stHeader"] {
-        background-color: #0b0f14 !important;
-        border-bottom: 1px solid #28313d !important;
-    }
-
-    /* Keep toolbar visible but visually integrated */
-    [data-testid="stToolbar"] {
-        background-color: #0b0f14 !important;
-    }
-
-    /* =========================================================
-       SIDEBAR
-       ========================================================= */
-
-    [data-testid="stSidebar"] {
-        background-color: #111720 !important;
-        border-right: 1px solid #293340 !important;
-    }
-
-    [data-testid="stSidebar"] * {
-        color: #dce4ee !important;
-    }
-
-    /* Give sidebar content breathing room */
-    [data-testid="stSidebarContent"] {
-        padding-top: 2rem !important;
-    }
-
-    /* =========================================================
-       TITLES
-       ========================================================= */
-
-    .title {
-        font-size: 2rem;
-        font-weight: 700;
-        line-height: 1.15;
-        color: #f3f6fa;
-        margin-top: 0 !important;
-        margin-bottom: 0.25rem;
-    }
-
-    .subtitle {
-        font-size: 0.9rem;
-        color: #8f9baa;
-        margin-bottom: 1rem;
-        line-height: 1.45;
-    }
-
-    /* =========================================================
-       STATUS BAR
-       ========================================================= */
-
-    .status {
-        font-size: 0.74rem;
-        color: #7e8a99;
-        border-top: 1px solid #28313d;
-        border-bottom: 1px solid #28313d;
-        padding: 0.65rem 0;
-        margin-top: 0.5rem;
-        margin-bottom: 1rem;
-    }
-
-    /* =========================================================
-       SECTION LABELS
-       ========================================================= */
-
-    .section {
-        font-size: 0.72rem;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        font-weight: 700;
-        color: #9aa6b5;
-        margin-top: 1rem;
-        margin-bottom: 0.5rem;
-    }
-
-    /* =========================================================
-       KPI CARDS
-       ========================================================= */
-
-    div[data-testid="stMetric"] {
-        background: #121923;
-        border: 1px solid #28313d;
-        border-radius: 4px;
-        padding: 0.75rem;
-        min-height: 105px;
-    }
-
-    div[data-testid="stMetricLabel"] {
-        color: #9aa6b5 !important;
-        font-size: 0.75rem !important;
-    }
-
-    div[data-testid="stMetricValue"] {
-        color: #f3f6fa !important;
-        font-size: 1.5rem !important;
-    }
-
-    /* =========================================================
-       TABLES
-       ========================================================= */
-
-    [data-testid="stDataFrame"] {
-        border: 1px solid #28313d;
-        border-radius: 3px;
-    }
-
-    /* =========================================================
-       BUTTONS
-       ========================================================= */
-
-    .stButton > button {
-        background-color: #151d28;
-        color: #dce4ee;
-        border: 1px solid #35404d;
-        border-radius: 4px;
-    }
-
-    .stButton > button:hover {
-        background-color: #1a2430;
-        border-color: #647487;
-        color: #ffffff;
-    }
-
-    /* =========================================================
-       ALERTS / INFO
-       ========================================================= */
-
-    .stAlert {
-        border-radius: 4px;
-    }
-
-    /* =========================================================
-       CHART SPACING
-       ========================================================= */
-
-    [data-testid="stPlotlyChart"] {
-        margin-top: 0.2rem;
-        margin-bottom: 0.5rem;
-    }
-
-    /* =========================================================
-       FOOTER
-       ========================================================= */
-
-    footer {
-        visibility: hidden;
-    }
-
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+    return hashlib.md5(raw).hexdigest()
 
 
 # ============================================================
-# API KEY
+# COLUMN COMPATIBILITY
 # ============================================================
 
-if not os.getenv("FRED_API_KEY"):
-    st.error(
-        "FRED_API_KEY is missing. Add it to Streamlit Cloud Secrets."
-    )
-    st.stop()
+def normalize_columns(
+    data: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Supports both FRED IDs and the project's internal
+    friendly column names.
+    """
 
+    df = data.copy()
 
-# ============================================================
-# SIDEBAR
-# ============================================================
+    aliases = {
+        "PCEPI": "pcepi",
+        "PCEPILFE": "core_pce",
+        "CUSR0000SAH1": "shelter",
+        "UNRATE": "unemployment",
+        "DPCERA3M086SBEA": "real_consumption",
+        "MICH": "inflation_expectations",
+        "WTISPLC": "oil",
+    }
 
-st.sidebar.markdown("## US INFLATION INTELLIGENCE")
-st.sidebar.caption("Macro research terminal")
+    for fred_id, internal_name in aliases.items():
 
-page = st.sidebar.radio(
-    "Navigation",
-    [
-        "Terminal",
-        "Forecast",
-        "Drivers",
-        "Data",
-    ],
-    label_visibility="collapsed",
-)
+        if (
+            internal_name not in df.columns
+            and fred_id in df.columns
+        ):
+            df[internal_name] = df[fred_id]
 
-st.sidebar.divider()
+    # --------------------------------------------------------
+    # Derived target / features
+    # --------------------------------------------------------
 
-st.sidebar.caption(
-    f"Window: {START_DATE} → {DATA_CUTOFF}"
-)
-
-if st.sidebar.button("Refresh data"):
-    st.cache_data.clear()
-    st.rerun()
-
-
-# ============================================================
-# DATA
-# ============================================================
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_data():
-    return fetch_model_data()
-
-
-try:
-    with st.spinner("Loading FRED data..."):
-        data = load_data()
-
-except Exception as exc:
-    st.error(f"Data pipeline failed: {exc}")
-    st.stop()
-
-
-# ============================================================
-# DIRECT SNAPSHOT
-# ============================================================
-# IMPORTANT:
-# We DO NOT call latest_snapshot().
-# We directly use the verified internal dataframe names.
-
-try:
-
-    target = data.dropna(
-        subset=["pce_inflation"]
-    )
-
-    if target.empty:
-        raise RuntimeError(
-            "No PCE inflation observations available."
-        )
-
-    latest = target.iloc[-1]
-    latest_date = target.index[-1]
-
-    current_pce = float(
-        latest["pce_inflation"]
-    )
-
-    current_core = float(
-        latest["core_pce_inflation"]
-    )
-
-except Exception as exc:
-
-    st.error(
-        f"Unable to create dashboard snapshot: {exc}"
-    )
-
-    st.write("Columns returned by data.py:")
-    st.write(list(data.columns))
-
-    st.stop()
-
-
-# ============================================================
-# FORECAST
-# ============================================================
-
-try:
-
-    with st.spinner(
-        "Running forecasting models..."
+    if (
+        "pce_inflation" not in df.columns
+        and "pcepi" in df.columns
     ):
-        forecasts = build_forecasts(
-            data
+        df["pce_inflation"] = (
+            df["pcepi"].pct_change(12) * 100
         )
 
-except Exception as exc:
+    if (
+        "core_pce_inflation" not in df.columns
+        and "core_pce" in df.columns
+    ):
+        df["core_pce_inflation"] = (
+            df["core_pce"].pct_change(12) * 100
+        )
 
-    st.error(
-        "Forecasting pipeline failed."
-    )
+    if (
+        "shelter_inflation" not in df.columns
+        and "shelter" in df.columns
+    ):
+        df["shelter_inflation"] = (
+            df["shelter"].pct_change(12) * 100
+        )
 
-    st.exception(exc)
+    if (
+        "consumption_growth" not in df.columns
+        and "real_consumption" in df.columns
+    ):
+        df["consumption_growth"] = (
+            df["real_consumption"].pct_change(12) * 100
+        )
 
-    st.stop()
+    if (
+        "oil_yoy" not in df.columns
+        and "oil" in df.columns
+    ):
+        df["oil_yoy"] = (
+            df["oil"].pct_change(12) * 100
+        )
+
+    if (
+        "oil_3m" not in df.columns
+        and "oil" in df.columns
+    ):
+        df["oil_3m"] = (
+            df["oil"].pct_change(3) * 100
+        )
+
+    if (
+        "expectations_change" not in df.columns
+        and "inflation_expectations" in df.columns
+    ):
+        df["expectations_change"] = (
+            df["inflation_expectations"].diff(3)
+        )
+
+    if (
+        "unemployment_change" not in df.columns
+        and "unemployment" in df.columns
+    ):
+        df["unemployment_change"] = (
+            df["unemployment"].diff(3)
+        )
+
+    return df
 
 
 # ============================================================
-# TERMINAL
+# VALIDATION
 # ============================================================
 
-if page == "Terminal":
+def validate_columns(
+    data: pd.DataFrame,
+) -> None:
 
-    st.markdown(
-        '<div class="title">US INFLATION INTELLIGENCE</div>',
-        unsafe_allow_html=True,
-    )
+    df = normalize_columns(data)
 
-    st.markdown(
-        '<div class="subtitle">'
-        "Is U.S. inflation moving sustainably toward the Federal Reserve's 2% objective?"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        f"""
-        <div class="status">
-            DATA VINTAGE: {DATA_CUTOFF}
-            &nbsp;&nbsp;|&nbsp;&nbsp;
-            LATEST PCE: {latest_date.strftime("%Y-%m")}
-            &nbsp;&nbsp;|&nbsp;&nbsp;
-            OBSERVATIONS: {len(data):,}
-            &nbsp;&nbsp;|&nbsp;&nbsp;
-            MODEL: {forecasts["selected_model"]}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-    # ========================================================
-    # KPI ROW
-    # ========================================================
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-
-    c1.metric(
-        "PCE inflation",
-        f"{current_pce:.2f}%",
-    )
-
-    c2.metric(
-        "Core PCE",
-        f"{current_core:.2f}%",
-    )
-
-    c3.metric(
-        "Fed target",
-        "2.00%",
-    )
-
-    c4.metric(
-        "3M forecast",
-        f'{forecasts["point_forecast_3m"]:.2f}%',
-    )
-
-    c5.metric(
-        "6M forecast",
-        f'{forecasts["point_forecast_6m"]:.2f}%',
-    )
-
-
-    # ========================================================
-    # MAIN CHART
-    # ========================================================
-
-    st.markdown(
-        '<div class="section">'
-        "PCE INFLATION · ACTUAL VS FORECAST"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    chart = forecasts["chart_df"]
-
-    history = chart[
-        chart["pce_inflation"].notna()
+    missing = [
+        column
+        for column in FEATURES
+        if column not in df.columns
     ]
 
-    future = chart[
-        chart["forecast"].notna()
-    ]
+    if missing:
+        raise KeyError(
+            "Missing model columns: "
+            + ", ".join(missing)
+            + "\n\nAvailable columns:\n"
+            + ", ".join(map(str, df.columns))
+        )
 
-    fig = go.Figure()
 
-    fig.add_trace(
-        go.Scatter(
-            x=history.index,
-            y=history["pce_inflation"],
-            mode="lines",
-            name="Actual",
-            line=dict(
-                color="#f4b942",
-                width=2.2,
+# ============================================================
+# FEATURE ENGINEERING
+# ============================================================
+
+def create_features(
+    data: pd.DataFrame,
+) -> pd.DataFrame:
+
+    df = normalize_columns(data)
+
+    validate_columns(df)
+
+    base = df[FEATURES].copy()
+
+    X = pd.DataFrame(
+        index=base.index
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Only lagged values are used.
+    # This prevents the current-period target
+    # from leaking into the prediction.
+    # --------------------------------------------------------
+
+    for column in FEATURES:
+
+        for lag in [1, 3, 6, 12]:
+
+            X[
+                f"{column}_lag{lag}"
+            ] = base[column].shift(lag)
+
+    return X
+
+
+# ============================================================
+# SUPERVISED DATA
+# ============================================================
+
+def supervised_data(
+    data: pd.DataFrame,
+    horizon: int,
+) -> Tuple[pd.DataFrame, pd.Series]:
+
+    df = normalize_columns(data)
+
+    X = create_features(df)
+
+    # Direct multi-horizon target.
+    # Horizon = 3 means predict PCE three months ahead.
+    y = df[TARGET].shift(-horizon)
+
+    combined = pd.concat(
+        [
+            X,
+            y.rename("target"),
+        ],
+        axis=1,
+    ).dropna()
+
+    if len(combined) < 100:
+
+        raise RuntimeError(
+            f"Only {len(combined)} usable observations "
+            f"remain for the {horizon}-month model."
+        )
+
+    return (
+        combined.drop(
+            columns=["target"]
+        ),
+        combined["target"],
+    )
+
+
+# ============================================================
+# XGBOOST
+# ============================================================
+
+def fit_xgboost(
+    X: pd.DataFrame,
+    y: pd.Series,
+) -> XGBRegressor:
+
+    model = XGBRegressor(
+        n_estimators=250,
+        max_depth=3,
+        learning_rate=0.04,
+        subsample=0.85,
+        colsample_bytree=0.80,
+        objective="reg:squarederror",
+        random_state=42,
+        n_jobs=2,
+        tree_method="hist",
+    )
+
+    model.fit(
+        X,
+        y,
+        verbose=False,
+    )
+
+    return model
+
+
+# ============================================================
+# RANDOM FOREST
+# ============================================================
+
+def fit_random_forest(
+    X: pd.DataFrame,
+    y: pd.Series,
+) -> RandomForestRegressor:
+
+    model = RandomForestRegressor(
+        n_estimators=150,
+        max_depth=6,
+        min_samples_leaf=3,
+        random_state=42,
+        n_jobs=2,
+    )
+
+    model.fit(
+        X,
+        y,
+    )
+
+    return model
+
+
+# ============================================================
+# XGBOOST CHRONOLOGICAL HOLDOUT
+# ============================================================
+
+def xgb_holdout(
+    data: pd.DataFrame,
+    horizon: int,
+    holdout_months: int = 24,
+):
+    """
+    Fast chronological validation.
+
+    One model is trained on the historical training window
+    and evaluated against a final contiguous holdout window.
+
+    This is intentionally much faster than fitting a new model
+    at every historical month.
+    """
+
+    X, y = supervised_data(
+        data,
+        horizon,
+    )
+
+    if len(X) <= holdout_months + 20:
+        holdout_months = max(
+            12,
+            len(X) // 5,
+        )
+
+    split = len(X) - holdout_months
+
+    X_train = X.iloc[:split]
+    y_train = y.iloc[:split]
+
+    X_test = X.iloc[split:]
+    y_test = y.iloc[split:]
+
+    model = fit_xgboost(
+        X_train,
+        y_train,
+    )
+
+    predictions = pd.Series(
+        model.predict(X_test),
+        index=X_test.index,
+        name="prediction",
+    )
+
+    actual = y_test.rename(
+        "actual"
+    )
+
+    return (
+        actual,
+        predictions,
+    )
+
+
+# ============================================================
+# SARIMAX FAST HOLDOUT
+# ============================================================
+
+def sarimax_holdout(
+    data: pd.DataFrame,
+    horizon: int,
+    holdout_months: int = 24,
+):
+
+    df = normalize_columns(data)
+
+    y = (
+        df[TARGET]
+        .dropna()
+    )
+
+    if len(y) <= holdout_months + 30:
+        holdout_months = max(
+            12,
+            len(y) // 5,
+        )
+
+    split = len(y) - holdout_months
+
+    train = y.iloc[:split]
+    test = y.iloc[split:]
+
+    model = SARIMAX(
+        train,
+        order=(1, 0, 1),
+        seasonal_order=(
+            1,
+            0,
+            1,
+            12,
+        ),
+        trend="c",
+        enforce_stationarity=False,
+        enforce_invertibility=False,
+    )
+
+    fitted = model.fit(
+        disp=False
+    )
+
+    predictions = fitted.forecast(
+        steps=len(test)
+    )
+
+    predictions = pd.Series(
+        predictions.values,
+        index=test.index,
+        name="prediction",
+    )
+
+    return (
+        test.rename("actual"),
+        predictions,
+    )
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def metrics(
+    actual: pd.Series,
+    predicted: pd.Series,
+) -> dict:
+
+    df = pd.concat(
+        [
+            actual,
+            predicted,
+        ],
+        axis=1,
+    ).dropna()
+
+    if df.empty:
+        return {
+            "MAE": np.nan,
+            "RMSE": np.nan,
+            "Bias": np.nan,
+        }
+
+    return {
+        "MAE": float(
+            mean_absolute_error(
+                df["actual"],
+                df["prediction"],
+            )
+        ),
+        "RMSE": float(
+            np.sqrt(
+                mean_squared_error(
+                    df["actual"],
+                    df["prediction"],
+                )
+            )
+        ),
+        "Bias": float(
+            (
+                df["prediction"]
+                - df["actual"]
+            ).mean()
+        ),
+    }
+
+
+# ============================================================
+# CONFORMAL CALIBRATION
+# ============================================================
+
+def conformal_radius(
+    actual: pd.Series,
+    predicted: pd.Series,
+    coverage: float = 0.80,
+) -> float:
+
+    residuals = (
+        actual
+        - predicted
+    ).abs().dropna()
+
+    if residuals.empty:
+        return 0.75
+
+    # Use the chronological holdout residuals.
+    return float(
+        residuals.quantile(
+            coverage,
+            interpolation="higher",
+        )
+    )
+
+
+# ============================================================
+# PRESSURE SCORE
+# ============================================================
+
+def pressure_score(
+    row: pd.Series,
+) -> int:
+
+    score = 50
+
+    if row["pce_inflation"] > 3:
+        score += 10
+
+    if row["core_pce_inflation"] > 3:
+        score += 8
+
+    if row["shelter_inflation"] > 4:
+        score += 7
+
+    if row["oil_yoy"] > 10:
+        score += 7
+
+    if row["inflation_expectations"] > 3:
+        score += 5
+
+    if row["unemployment"] < 4.5:
+        score += 5
+
+    return int(
+        max(
+            0,
+            min(
+                100,
+                score,
             ),
         )
     )
 
-    fig.add_trace(
-        go.Scatter(
-            x=future.index,
-            y=future["forecast"],
-            mode="lines",
-            name="Forecast",
-            line=dict(
-                color="#4fa3ff",
-                width=2.2,
-                dash="dash",
-            ),
+
+# ============================================================
+# REGIME
+# ============================================================
+
+def detect_regime(
+    data: pd.DataFrame,
+) -> str:
+
+    df = normalize_columns(data)
+
+    target = (
+        df[TARGET]
+        .dropna()
+    )
+
+    if len(target) < 4:
+        return "Insufficient data"
+
+    current = float(
+        target.iloc[-1]
+    )
+
+    momentum = float(
+        target.diff(3).iloc[-1]
+    )
+
+    if (
+        current < 2.5
+        and momentum <= 0
+    ):
+        return "Low / Disinflationary"
+
+    if (
+        current >= 3.5
+        and momentum > 0
+    ):
+        return "Reflationary"
+
+    return "Stable"
+
+
+# ============================================================
+# FINAL FORECAST
+# ============================================================
+
+def build_forecasts(
+    data: pd.DataFrame,
+    fast_mode: bool = True,
+) -> dict:
+
+    df = normalize_columns(data)
+
+    validate_columns(df)
+
+    cache_key = (
+        _data_key(df)
+        + f"_{fast_mode}"
+    )
+
+    if cache_key in _MODEL_CACHE:
+        return _MODEL_CACHE[cache_key]
+
+    # ========================================================
+    # VALIDATION
+    # ========================================================
+
+    xgb_actual_3, xgb_pred_3 = xgb_holdout(
+        df,
+        horizon=3,
+        holdout_months=24,
+    )
+
+    sar_actual_3, sar_pred_3 = sarimax_holdout(
+        df,
+        horizon=3,
+        holdout_months=24,
+    )
+
+    xgb_metrics = metrics(
+        xgb_actual_3,
+        xgb_pred_3,
+    )
+
+    sar_metrics = metrics(
+        sar_actual_3,
+        sar_pred_3,
+    )
+
+    model_metrics = {
+        "XGBoost": xgb_metrics,
+        "SARIMAX": sar_metrics,
+    }
+
+    # Select model based on chronological holdout MAE.
+    if (
+        np.isfinite(xgb_metrics["MAE"])
+        and (
+            xgb_metrics["MAE"]
+            <= sar_metrics["MAE"]
         )
+    ):
+        selected_model = "XGBoost"
+    else:
+        selected_model = "SARIMAX"
+
+    # ========================================================
+    # FINAL XGBOOST 3M
+    # ========================================================
+
+    X3, y3 = supervised_data(
+        df,
+        horizon=3,
     )
 
-    fig.add_trace(
-        go.Scatter(
-            x=future.index,
-            y=future["upper"],
-            mode="lines",
-            line=dict(width=0),
-            showlegend=False,
-            hoverinfo="skip",
+    final_xgb_3 = fit_xgboost(
+        X3,
+        y3,
+    )
+
+    point_3m = float(
+        final_xgb_3.predict(
+            X3.iloc[[-1]]
+        )[0]
+    )
+
+    conformal_3m = conformal_radius(
+        xgb_actual_3,
+        xgb_pred_3,
+        coverage=0.80,
+    )
+
+    # ========================================================
+    # FINAL XGBOOST 6M
+    # ========================================================
+
+    X6, y6 = supervised_data(
+        df,
+        horizon=6,
+    )
+
+    final_xgb_6 = fit_xgboost(
+        X6,
+        y6,
+    )
+
+    point_6m = float(
+        final_xgb_6.predict(
+            X6.iloc[[-1]]
+        )[0]
+    )
+
+    # ========================================================
+    # FEATURE IMPORTANCE
+    # ========================================================
+
+    importance = (
+        pd.Series(
+            final_xgb_3.feature_importances_,
+            index=X3.columns,
         )
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=future.index,
-            y=future["lower"],
-            mode="lines",
-            fill="tonexty",
-            fillcolor="rgba(79,163,255,0.12)",
-            line=dict(width=0),
-            name="80% prediction range",
+        .sort_values(
+            ascending=False
         )
+        .head(8)
     )
 
-    fig.add_hline(
-        y=2.0,
-        line_dash="dot",
-        line_color="#7d8794",
-        annotation_text="Fed 2%",
-        annotation_position="top left",
-    )
+    driver_list = []
 
-    fig.update_layout(
-        height=450,
-        paper_bgcolor="#0b0f14",
-        plot_bgcolor="#0b0f14",
-        font=dict(
-            color="#c9d2dd"
-        ),
-        margin=dict(
-            l=10,
-            r=10,
-            t=20,
-            b=10,
-        ),
-        hovermode="x unified",
-        legend=dict(
-            orientation="h",
-            y=1.05,
-            x=0,
-        ),
-        xaxis=dict(
-            showgrid=False
-        ),
-        yaxis=dict(
-            title="% YoY",
-            gridcolor="#1c2530",
-        ),
-    )
+    for feature, value in importance.items():
 
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-    )
+        friendly = (
+            feature
+            .replace(
+                "_lag1",
+                " lag 1",
+            )
+            .replace(
+                "_lag3",
+                " lag 3",
+            )
+            .replace(
+                "_lag6",
+                " lag 6",
+            )
+            .replace(
+                "_lag12",
+                " lag 12",
+            )
+            .replace(
+                "_",
+                " ",
+            )
+        )
 
+        driver_list.append(
+            (
+                friendly,
+                float(value),
+            )
+        )
 
     # ========================================================
     # CURRENT STATE
     # ========================================================
 
-    left, right = st.columns(
-        [1.5, 1]
+    target = (
+        df[TARGET]
+        .dropna()
     )
 
-    with left:
+    latest = target.iloc[-1]
 
-        st.markdown(
-            '<div class="section">'
-            "AI MACRO BRIEF"
-            "</div>",
-            unsafe_allow_html=True,
+    current_row = df.dropna(
+        subset=[
+            TARGET,
+            "core_pce_inflation",
+        ]
+    ).iloc[-1]
+
+    p_score = pressure_score(
+        current_row
+    )
+
+    regime = detect_regime(
+        df
+    )
+
+    if model_metrics[
+        selected_model
+    ]["MAE"] < 0.35:
+
+        confidence = "High"
+
+    elif model_metrics[
+        selected_model
+    ]["MAE"] < 0.55:
+
+        confidence = "Medium"
+
+    else:
+
+        confidence = "Low"
+
+    # ========================================================
+    # CHART DATA
+    # ========================================================
+
+    history = (
+        target
+        .tail(84)
+        .rename(
+            "pce_inflation"
         )
+        .to_frame()
+    )
 
-        st.info(
-            forecasts["macro_brief"]
-        )
+    last_history_date = (
+        history.index[-1]
+    )
 
-    with right:
+    future_dates = pd.date_range(
+        last_history_date
+        + pd.offsets.MonthBegin(1),
+        periods=6,
+        freq="MS",
+    )
 
-        st.markdown(
-            '<div class="section">'
-            "CURRENT STATE"
-            "</div>",
-            unsafe_allow_html=True,
-        )
+    # Bridge current → 3M → 6M.
+    forecast_path = np.concatenate(
+        [
+            np.linspace(
+                float(latest),
+                point_3m,
+                3,
+            ),
+            np.linspace(
+                point_3m,
+                point_6m,
+                3,
+            ),
+        ]
+    )
 
-        st.metric(
-            "Inflation pressure",
-            f'{forecasts["pressure_score"]}/100',
-        )
+    lower_path = (
+        forecast_path
+        - conformal_3m
+    )
 
-        st.metric(
-            "Regime",
-            forecasts["regime"],
-        )
+    upper_path = (
+        forecast_path
+        + conformal_3m
+    )
 
-        st.metric(
-            "Confidence",
-            forecasts["confidence"],
-        )
+    future_df = pd.DataFrame(
+        {
+            "pce_inflation": np.nan,
+            "forecast": forecast_path,
+            "lower": lower_path,
+            "upper": upper_path,
+        },
+        index=future_dates,
+    )
+
+    history[
+        "forecast"
+    ] = np.nan
+
+    history[
+        "lower"
+    ] = np.nan
+
+    history[
+        "upper"
+    ] = np.nan
+
+    chart_df = pd.concat(
+        [
+            history,
+            future_df,
+        ]
+    )
+
+    # ========================================================
+    # FORECAST TABLE
+    # ========================================================
+
+    forecast_table = pd.DataFrame(
+        [
+            [
+                "Current",
+                float(latest),
+                np.nan,
+                np.nan,
+            ],
+            [
+                "3M",
+                point_3m,
+                point_3m
+                - conformal_3m,
+                point_3m
+                + conformal_3m,
+            ],
+            [
+                "6M",
+                point_6m,
+                np.nan,
+                np.nan,
+            ],
+        ],
+        columns=[
+            "Horizon",
+            "Forecast",
+            "Lower",
+            "Upper",
+        ],
+    )
+
+    # ========================================================
+    # REGIME HISTORY
+    # ========================================================
+
+    regime_history = (
+        df[
+            [TARGET]
+        ]
+        .dropna()
+        .copy()
+    )
+
+    momentum = (
+        regime_history[
+            TARGET
+        ].diff(3)
+    )
+
+    regime_history[
+        "regime"
+    ] = np.select(
+        [
+            (
+                (
+                    regime_history[
+                        TARGET
+                    ] < 2.5
+                )
+                & (
+                    momentum <= 0
+                )
+            ),
+            (
+                (
+                    regime_history[
+                        TARGET
+                    ] >= 3.5
+                )
+                & (
+                    momentum > 0
+                )
+            ),
+        ],
+        [
+            "Low / Disinflationary",
+            "Reflationary",
+        ],
+        default="Stable",
+    )
+
+    # ========================================================
+    # MACRO BRIEF
+    # ========================================================
+
+    distance_to_target = (
+        point_3m
+        - FED_TARGET
+    )
+
+    direction = (
+        "higher"
+        if point_3m > float(latest)
+        else "lower"
+        if point_3m < float(latest)
+        else "unchanged"
+    )
+
+    macro_brief = (
+        f"The model forecasts PCE inflation at "
+        f"{point_3m:.2f}% in three months and "
+        f"{point_6m:.2f}% in six months. "
+        f"Compared with the current inflation rate of "
+        f"{float(latest):.2f}%, the 3-month forecast is "
+        f"{direction}. The 3-month forecast is "
+        f"{distance_to_target:+.2f} percentage points "
+        f"from the Federal Reserve's 2% objective. "
+        f"The current inflation environment is "
+        f"{regime.lower()}, with an inflation-pressure "
+        f"score of {p_score}/100. "
+        f"The XGBoost 80% prediction range for the "
+        f"3-month forecast is "
+        f"{point_3m - conformal_3m:.2f}% to "
+        f"{point_3m + conformal_3m:.2f}%. "
+        f"This is a research-model estimate, not an "
+        f"official Federal Reserve forecast."
+    )
+
+    # ========================================================
+    # RESULT
+    # ========================================================
+
+    result = {
+        "selected_model": selected_model,
+
+        "point_forecast_3m":
+            point_3m,
+
+        "point_forecast_6m":
+            point_6m,
+
+        "lower_3m":
+            point_3m
+            - conformal_3m,
+
+        "upper_3m":
+            point_3m
+            + conformal_3m,
+
+        "pressure_score":
+            p_score,
+
+        "regime":
+            regime,
+
+        "confidence":
+            confidence,
+
+        "macro_brief":
+            macro_brief,
+
+        "chart_df":
+            chart_df,
+
+        "forecast_table":
+            forecast_table,
+
+        "xgb_drivers":
+            driver_list,
+
+        "regime_history":
+            regime_history,
+
+        "raw_metrics":
+            model_metrics,
+
+        "xgb_actual":
+            xgb_actual_3,
+
+        "xgb_pred":
+            xgb_pred_3,
+
+        "sar_actual":
+            sar_actual_3,
+
+        "sar_pred":
+            sar_pred_3,
+    }
+
+    _MODEL_CACHE[
+        cache_key
+    ] = result
+
+    return result
 
 
 # ============================================================
-# FORECAST PAGE
+# DIAGNOSTICS
 # ============================================================
 
-elif page == "Forecast":
+def model_diagnostics(
+    forecasts: dict,
+) -> dict:
 
-    st.markdown(
-        '<div class="title">FORECAST</div>',
-        unsafe_allow_html=True,
-    )
+    performance_rows = []
 
-    st.markdown(
-        '<div class="subtitle">'
-        "Econometric and machine-learning forecast comparison."
-        "</div>",
-        unsafe_allow_html=True,
-    )
+    for model_name, metric in (
+        forecasts[
+            "raw_metrics"
+        ].items()
+    ):
 
-    st.markdown(
-        '<div class="section">'
-        "FORECAST OUTPUT"
-        "</div>",
-        unsafe_allow_html=True,
-    )
+        performance_rows.append(
+            {
+                "Model":
+                    model_name,
 
-    forecast_table = forecasts[
-        "forecast_table"
-    ].copy()
+                "MAE":
+                    round(
+                        metric["MAE"],
+                        4,
+                    ),
 
-    forecast_table[
-        "Forecast"
-    ] = forecast_table[
-        "Forecast"
-    ].round(2)
+                "RMSE":
+                    round(
+                        metric["RMSE"],
+                        4,
+                    ),
 
-    forecast_table[
-        "Lower"
-    ] = forecast_table[
-        "Lower"
-    ].round(2)
+                "Bias":
+                    round(
+                        metric["Bias"],
+                        4,
+                    ),
 
-    forecast_table[
-        "Upper"
-    ] = forecast_table[
-        "Upper"
-    ].round(2)
-
-    st.dataframe(
-        forecast_table,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-    st.markdown(
-        '<div class="section">'
-        "MODEL PERFORMANCE"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    diagnostics = model_diagnostics(
-        forecasts
-    )
-
-    st.dataframe(
-        diagnostics["performance"],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-    st.markdown(
-        '<div class="section">'
-        "PREDICTION INTERVAL CALIBRATION"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    st.dataframe(
-        diagnostics["coverage"],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-# ============================================================
-# DRIVERS PAGE
-# ============================================================
-
-elif page == "Drivers":
-
-    st.markdown(
-        '<div class="title">DRIVERS</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        '<div class="subtitle">'
-        "What matters most to the forecasting model?"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    drivers = driver_table(
-        forecasts
-    )
-
-    if not drivers.empty:
-
-        st.dataframe(
-            drivers,
-            use_container_width=True,
-            hide_index=True,
+                "Validation":
+                    "Chronological holdout",
+            }
         )
 
-        fig = go.Figure(
-            go.Bar(
-                x=drivers[
-                    "Relative strength"
-                ],
-                y=drivers[
-                    "Driver"
-                ],
-                orientation="h",
-                marker=dict(
-                    color="#4fa3ff"
-                ),
+    performance = (
+        pd.DataFrame(
+            performance_rows
+        )
+        .sort_values(
+            "MAE"
+        )
+    )
+
+    # --------------------------------------------------------
+    # Conformal coverage on the historical holdout.
+    # --------------------------------------------------------
+
+    actual = forecasts[
+        "xgb_actual"
+    ]
+
+    predicted = forecasts[
+        "xgb_pred"
+    ]
+
+    residuals = (
+        actual
+        - predicted
+    ).dropna()
+
+    coverage_results = []
+
+    for i in range(
+        12,
+        len(residuals),
+    ):
+
+        calibration = (
+            residuals.iloc[
+                :i
+            ].abs()
+        )
+
+        radius = calibration.quantile(
+            0.80,
+            interpolation="higher",
+        )
+
+        covered = (
+            abs(
+                residuals.iloc[i]
+            )
+            <= radius
+        )
+
+        coverage_results.append(
+            covered
+        )
+
+    if coverage_results:
+
+        empirical = (
+            100
+            * np.mean(
+                coverage_results
             )
         )
 
-        fig.update_layout(
-            height=400,
-            paper_bgcolor="#0b0f14",
-            plot_bgcolor="#0b0f14",
-            font=dict(
-                color="#c9d2dd"
-            ),
-            margin=dict(
-                l=10,
-                r=10,
-                t=10,
-                b=10,
-            ),
-            xaxis=dict(
-                title="Relative model importance",
-                gridcolor="#1c2530",
-            ),
-            yaxis=dict(
-                showgrid=False
-            ),
+        empirical_text = (
+            f"{empirical:.1f}%"
         )
 
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-        )
+    else:
 
+        empirical_text = "N/A"
 
-    st.markdown(
-        '<div class="section">'
-        "INFLATION REGIME"
-        "</div>",
-        unsafe_allow_html=True,
+    coverage = pd.DataFrame(
+        [
+            {
+                "Model":
+                    "XGBoost",
+
+                "Target coverage":
+                    "80%",
+
+                "Empirical coverage":
+                    empirical_text,
+
+                "Calibration":
+                    "Temporal holdout conformal",
+            }
+        ]
     )
 
-    regime_df = forecasts[
-        "regime_history"
+    return {
+        "performance":
+            performance,
+
+        "coverage":
+            coverage,
+    }
+
+
+# ============================================================
+# DRIVER TABLE
+# ============================================================
+
+def driver_table(
+    forecasts: dict,
+) -> pd.DataFrame:
+
+    drivers = forecasts[
+        "xgb_drivers"
     ]
 
-    regime_fig = go.Figure()
+    if not drivers:
 
-    regime_fig.add_trace(
-        go.Scatter(
-            x=regime_df.index,
-            y=regime_df[
-                "pce_inflation"
-            ],
-            mode="lines",
-            name="PCE",
-            line=dict(
-                color="#f4b942",
-                width=2,
-            ),
+        return pd.DataFrame(
+            columns=[
+                "Driver",
+                "Model importance",
+                "Relative strength",
+            ]
         )
+
+    max_value = max(
+        value
+        for _, value
+        in drivers
     )
 
-    regime_fig.add_hline(
-        y=2.0,
-        line_dash="dot",
-        line_color="#7d8794",
+    rows = []
+
+    for name, value in drivers:
+
+        rows.append(
+            {
+                "Driver":
+                    name.title(),
+
+                "Model importance":
+                    round(
+                        value,
+                        4,
+                    ),
+
+                "Relative strength":
+                    round(
+                        value / max_value,
+                        2,
+                    )
+                    if max_value
+                    else 0,
+            }
+        )
+
+    return pd.DataFrame(
+        rows
     )
-
-    regime_fig.update_layout(
-        height=350,
-        paper_bgcolor="#0b0f14",
-        plot_bgcolor="#0b0f14",
-        font=dict(
-            color="#c9d2dd"
-        ),
-        margin=dict(
-            l=10,
-            r=10,
-            t=10,
-            b=10,
-        ),
-        xaxis=dict(
-            showgrid=False
-        ),
-        yaxis=dict(
-            title="% YoY",
-            gridcolor="#1c2530",
-        ),
-    )
-
-    st.plotly_chart(
-        regime_fig,
-        use_container_width=True,
-    )
-
-
-# ============================================================
-# DATA PAGE
-# ============================================================
-
-elif page == "Data":
-
-    st.markdown(
-        '<div class="title">DATA</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        '<div class="subtitle">'
-        "Data actually returned by the FRED pipeline."
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    st.write(
-        f"Rows: {len(data):,}"
-    )
-
-    st.write(
-        f"Columns: {len(data.columns):,}"
-    )
-
-    st.write(
-        f"Latest observation: "
-        f"{data.index[-1].strftime('%Y-%m')}"
-    )
-
-    st.dataframe(
-        data.tail(20),
-        use_container_width=True,
-    )
-
-    st.download_button(
-        "Download processed data",
-        data=data.to_csv().encode(
-            "utf-8"
-        ),
-        file_name=(
-            "us_inflation_data.csv"
-        ),
-        mime="text/csv",
-    )
-
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.divider()
-
-st.caption(
-    "US Inflation Intelligence · "
-    "Research / portfolio tool · "
-    "Not an official Federal Reserve forecast."
-)
