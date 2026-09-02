@@ -30,46 +30,99 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+
+    /* =========================================================
+       GLOBAL LAYOUT
+       ========================================================= */
+
     .stApp {
         background-color: #0b0f14;
         color: #e8edf3;
     }
 
-    .block-container {
+    /* Reserve space below Streamlit's top ribbon */
+    .main .block-container {
         max-width: 1500px;
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
+        padding-top: 5.5rem !important;
+        padding-bottom: 2.5rem !important;
+        padding-left: 2rem !important;
+        padding-right: 2rem !important;
     }
 
+    /* Prevent content from sitting underneath the header */
+    [data-testid="stAppViewContainer"] {
+        padding-top: 0 !important;
+    }
+
+    /* =========================================================
+       STREAMLIT TOP HEADER
+       ========================================================= */
+
+    [data-testid="stHeader"] {
+        background-color: #0b0f14 !important;
+        border-bottom: 1px solid #28313d !important;
+    }
+
+    /* Keep toolbar visible but visually integrated */
+    [data-testid="stToolbar"] {
+        background-color: #0b0f14 !important;
+    }
+
+    /* =========================================================
+       SIDEBAR
+       ========================================================= */
+
     [data-testid="stSidebar"] {
-        background-color: #111720;
-        border-right: 1px solid #293340;
+        background-color: #111720 !important;
+        border-right: 1px solid #293340 !important;
     }
 
     [data-testid="stSidebar"] * {
         color: #dce4ee !important;
     }
 
+    /* Give sidebar content breathing room */
+    [data-testid="stSidebarContent"] {
+        padding-top: 2rem !important;
+    }
+
+    /* =========================================================
+       TITLES
+       ========================================================= */
+
     .title {
         font-size: 2rem;
         font-weight: 700;
+        line-height: 1.15;
         color: #f3f6fa;
+        margin-top: 0 !important;
+        margin-bottom: 0.25rem;
     }
 
     .subtitle {
         font-size: 0.9rem;
         color: #8f9baa;
         margin-bottom: 1rem;
+        line-height: 1.45;
     }
 
+    /* =========================================================
+       STATUS BAR
+       ========================================================= */
+
     .status {
-        font-size: 0.75rem;
+        font-size: 0.74rem;
         color: #7e8a99;
         border-top: 1px solid #28313d;
         border-bottom: 1px solid #28313d;
-        padding: 0.6rem 0;
+        padding: 0.65rem 0;
+        margin-top: 0.5rem;
         margin-bottom: 1rem;
     }
+
+    /* =========================================================
+       SECTION LABELS
+       ========================================================= */
 
     .section {
         font-size: 0.72rem;
@@ -81,11 +134,16 @@ st.markdown(
         margin-bottom: 0.5rem;
     }
 
+    /* =========================================================
+       KPI CARDS
+       ========================================================= */
+
     div[data-testid="stMetric"] {
         background: #121923;
         border: 1px solid #28313d;
         border-radius: 4px;
-        padding: 0.7rem;
+        padding: 0.75rem;
+        min-height: 105px;
     }
 
     div[data-testid="stMetricLabel"] {
@@ -95,7 +153,60 @@ st.markdown(
 
     div[data-testid="stMetricValue"] {
         color: #f3f6fa !important;
+        font-size: 1.5rem !important;
     }
+
+    /* =========================================================
+       TABLES
+       ========================================================= */
+
+    [data-testid="stDataFrame"] {
+        border: 1px solid #28313d;
+        border-radius: 3px;
+    }
+
+    /* =========================================================
+       BUTTONS
+       ========================================================= */
+
+    .stButton > button {
+        background-color: #151d28;
+        color: #dce4ee;
+        border: 1px solid #35404d;
+        border-radius: 4px;
+    }
+
+    .stButton > button:hover {
+        background-color: #1a2430;
+        border-color: #647487;
+        color: #ffffff;
+    }
+
+    /* =========================================================
+       ALERTS / INFO
+       ========================================================= */
+
+    .stAlert {
+        border-radius: 4px;
+    }
+
+    /* =========================================================
+       CHART SPACING
+       ========================================================= */
+
+    [data-testid="stPlotlyChart"] {
+        margin-top: 0.2rem;
+        margin-bottom: 0.5rem;
+    }
+
+    /* =========================================================
+       FOOTER
+       ========================================================= */
+
+    footer {
+        visibility: hidden;
+    }
+
     </style>
     """,
     unsafe_allow_html=True,
