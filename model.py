@@ -321,97 +321,97 @@ def _driver_table(data: pd.DataFrame, model) -> pd.DataFrame:
     return out.head(6).reset_index(drop=True)
 
 
-def build_forecast(data: pd.DataFrame) -> ForecastResult:
-    data = data.copy()
-    target = data[TARGET].dropna()
-
-    # Walk-forward validation.
-    validation = {}
-    metric_rows = []
-
+def _naive_metrics(target: pd.Series) -> pd.DataFrame:
+    rows = []
     for h in HORIZONS:
-        xgb_eval = _walk_forward_xgb(data, h)
-        sarimax_eval = _walk_forward_sarimax(data, h)
-
-        validation[("XGBoost", h)] = xgb_eval
-        validation[("SARIMAX", h)] = sarimax_eval
-        metric_rows.append(_metrics(xgb_eval, "XGBoost", h))
-        metric_rows.append(_metrics(sarimax_eval, "SARIMAX", h))
-
-        naive_actual = target.iloc[h:]
-        naive_pred = target.iloc[:-h].values
-        n = min(len(naive_actual), len(naive_pred))
-        naive_rows = pd.DataFrame(
-            {
-                "actual": naive_actual.iloc[:n].values,
-                "pred": naive_pred[:n],
-            }
-        )
-        metric_rows.append(
+        actual = target.iloc[h:].to_numpy()
+        pred = target.iloc[:-h].to_numpy()
+        n = min(len(actual), len(pred))
+        actual = actual[:n]
+        pred = pred[:n]
+        rows.append(
             {
                 "model": "Naive",
                 "horizon": h,
-                "MAE": float(mean_absolute_error(naive_rows["actual"], naive_rows["pred"])),
-                "RMSE": float(mean_squared_error(naive_rows["actual"], naive_rows["pred"]) ** 0.5),
-                "Bias": float((naive_rows["pred"] - naive_rows["actual"]).mean()),
+                "MAE": float(mean_absolute_error(actual, pred)),
+                "RMSE": float(mean_squared_error(actual, pred) ** 0.5),
+                "Bias": float((pred - actual).mean()),
                 "n": int(n),
             }
         )
+    return pd.DataFrame(rows)
 
-    metrics = pd.DataFrame(metric_rows)
 
-    # Final models fitted on all available data.
-    predictions = []
-    final_xgb_by_h = {}
+def run_research_validation(data: pd.DataFrame, max_origins: int = 24) -> pd.DataFrame:
+    """Run expensive rolling-origin validation on demand, never during app startup."""
+    metric_rows = []
+    target = data[TARGET].dropna()
     for h in HORIZONS:
+        xgb_eval = _walk_forward_xgb(data, h, min_train=96)
+        sarimax_eval = _walk_forward_sarimax(data, h, min_train=96)
+        if len(xgb_eval) > max_origins:
+            xgb_eval = xgb_eval.tail(max_origins)
+        if len(sarimax_eval) > max_origins:
+            sarimax_eval = sarimax_eval.tail(max_origins)
+        metric_rows.append(_metrics(xgb_eval, "XGBoost", h))
+        metric_rows.append(_metrics(sarimax_eval, "SARIMAX", h))
+    return pd.concat([_naive_metrics(target), pd.DataFrame(metric_rows)], ignore_index=True)
+
+
+def build_forecast(data: pd.DataFrame, validation_metrics: pd.DataFrame | None = None) -> ForecastResult:
+    """Fast production forecast. Expensive walk-forward validation is intentionally external."""
+    data = data.copy()
+    target = data[TARGET].dropna()
+
+    # Fit each direct XGBoost model once. These are the production ML forecasts.
+    xgb_path = []
+    final_xgb_by_h = {}
+    for h in range(1, 7):
         model, features = _fit_direct_xgb(data, h)
         final_xgb_by_h[h] = model
-        row = features.dropna().iloc[[-1]]
-        pred = float(model.predict(row)[0])
-        predictions.append({"horizon": h, "xgb": pred})
+        latest_row = features.iloc[[-1]].reindex(columns=features.columns)
+        if latest_row.isna().all(axis=1).iloc[0]:
+            raise RuntimeError("Latest feature row is unavailable for forecasting.")
+        xgb_path.append(float(model.predict(latest_row)[0]))
 
-    # SARIMAX 6M path, used as an econometric challenger.
-    sarimax_mean, sarimax_conf = _safe_sarimax(target, 6)
+    # One econometric model produces the complete six-month challenger path.
+    sarimax_mean, _ = _safe_sarimax(target, 6)
 
-    # Select / blend using 3M validation.
-    xgb_3 = validation[("XGBoost", 3)]
-    sar_3 = validation[("SARIMAX", 3)]
-    xgb_mae = _metrics(xgb_3, "XGBoost", 3)["MAE"]
-    sar_mae = _metrics(sar_3, "SARIMAX", 3)["MAE"]
-
-    if not np.isfinite(xgb_mae):
-        weights = {"XGBoost": 0.0, "SARIMAX": 1.0}
-    elif not np.isfinite(sar_mae):
-        weights = {"XGBoost": 1.0, "SARIMAX": 0.0}
-    elif abs(xgb_mae - sar_mae) < 0.10:
-        weights = {"XGBoost": 0.5, "SARIMAX": 0.5}
-    elif xgb_mae < sar_mae:
-        weights = {"XGBoost": 0.65, "SARIMAX": 0.35}
+    # Prefer previously validated weights when supplied. Until research validation is run,
+    # use a neutral 50/50 mix rather than pretending one model has already won.
+    if validation_metrics is not None and not validation_metrics.empty:
+        xgb3 = validation_metrics.query("model == 'XGBoost' and horizon == 3")
+        sar3 = validation_metrics.query("model == 'SARIMAX' and horizon == 3")
+        xgb_mae = float(xgb3["MAE"].iloc[0]) if not xgb3.empty else np.nan
+        sar_mae = float(sar3["MAE"].iloc[0]) if not sar3.empty else np.nan
+        if np.isfinite(xgb_mae) and np.isfinite(sar_mae):
+            if abs(xgb_mae - sar_mae) < 0.10:
+                weights = {"XGBoost": 0.50, "SARIMAX": 0.50}
+            elif xgb_mae < sar_mae:
+                weights = {"XGBoost": 0.65, "SARIMAX": 0.35}
+            else:
+                weights = {"XGBoost": 0.35, "SARIMAX": 0.65}
+        else:
+            weights = {"XGBoost": 0.50, "SARIMAX": 0.50}
     else:
-        weights = {"XGBoost": 0.35, "SARIMAX": 0.65}
+        weights = {"XGBoost": 0.50, "SARIMAX": 0.50}
 
-    xgb_path = []
-    for h in range(1, 7):
-        model, features = _fit_direct_xgb(data, h)
-        row = features.dropna().iloc[[-1]]
-        xgb_path.append(float(model.predict(row)[0]))
+    ensemble = [
+        weights["XGBoost"] * xgb_path[h - 1] + weights["SARIMAX"] * sarimax_mean[h - 1]
+        for h in range(1, 7)
+    ]
 
-    ensemble = []
-    for h in range(1, 7):
-        value = weights["XGBoost"] * xgb_path[h - 1]
-        value += weights["SARIMAX"] * sarimax_mean[h - 1]
-        ensemble.append(value)
+    # Prediction interval. Until a research backtest exists this is explicitly provisional.
+    if validation_metrics is not None and not validation_metrics.empty:
+        xgb3 = validation_metrics.query("model == 'XGBoost' and horizon == 3")
+        radius = float(xgb3["MAE"].iloc[0]) * 1.35 if not xgb3.empty and np.isfinite(xgb3["MAE"].iloc[0]) else 0.45
+        calibration_note = "Backtest-calibrated proxy"
+    else:
+        radius = 0.45
+        calibration_note = "Provisional until backtest is run"
 
-    # Prediction intervals calibrated from 3M XGB walk-forward absolute residuals.
-    residuals = np.abs(xgb_3["error"].values) if not xgb_3.empty else np.array([0.4])
-    q80 = float(np.quantile(residuals, 0.80))
-    lower = []
-    upper = []
-    for h, point in enumerate(ensemble, start=1):
-        radius = q80 * np.sqrt(h / 3)
-        lower.append(point - radius)
-        upper.append(point + radius)
-
+    lower = [p - radius * np.sqrt(h / 3) for h, p in enumerate(ensemble, start=1)]
+    upper = [p + radius * np.sqrt(h / 3) for h, p in enumerate(ensemble, start=1)]
     forecast = pd.DataFrame(
         {
             "horizon": np.arange(1, 7),
@@ -421,21 +421,13 @@ def build_forecast(data: pd.DataFrame) -> ForecastResult:
         }
     )
 
-    # Driver ranking from 3M XGB.
     drivers = _driver_table(data, final_xgb_by_h[3])
 
-    # Regime-like history based on transparent rolling momentum, not HMM.
     hist = data[[TARGET]].dropna().copy()
     hist["momentum_3m"] = hist[TARGET].rolling(3).mean().diff(3)
     hist["state"] = np.select(
-        [
-            hist["momentum_3m"] <= -0.15,
-            hist["momentum_3m"] >= 0.15,
-        ],
-        [
-            "Moderating",
-            "Reaccelerating",
-        ],
+        [hist["momentum_3m"] <= -0.15, hist["momentum_3m"] >= 0.15],
+        ["Moderating", "Reaccelerating"],
         default="Stable",
     )
     hist = hist.reset_index(names="date")
@@ -443,17 +435,26 @@ def build_forecast(data: pd.DataFrame) -> ForecastResult:
     state = _state(data, forecast)
     state["weights"] = weights
 
-    # Empirical 80% interval coverage on the available 3M XGB walk-forward sample.
-    coverage = (
-        float((np.abs(xgb_3["error"]) <= q80).mean()) if not xgb_3.empty else np.nan
-    )
-    calibration = {
-        "target": 0.80,
-        "empirical_coverage": coverage,
-        "radius": q80,
-        "n": int(len(xgb_3)),
-    }
+    if validation_metrics is not None and not validation_metrics.empty:
+        xgb3 = validation_metrics.query("model == 'XGBoost' and horizon == 3")
+        calibration_radius = float(xgb3["MAE"].iloc[0]) if not xgb3.empty else np.nan
+        calibration = {
+            "target": 0.80,
+            "empirical_coverage": np.nan,
+            "radius": calibration_radius,
+            "n": 0,
+            "note": calibration_note,
+        }
+    else:
+        calibration = {
+            "target": 0.80,
+            "empirical_coverage": np.nan,
+            "radius": radius,
+            "n": 0,
+            "note": calibration_note,
+        }
 
+    metrics = validation_metrics.copy() if validation_metrics is not None else _naive_metrics(target)
     latest_date = data.dropna(subset=[TARGET]).index[-1].date().isoformat()
 
     chat_context = {
@@ -466,16 +467,14 @@ def build_forecast(data: pd.DataFrame) -> ForecastResult:
         "calibration": calibration,
         "latest": data.iloc[-1][
             [
-                c
-                for c in [
+                c for c in [
                     "core_pce_inflation",
                     "shelter_inflation",
                     "unemployment",
                     "consumption_growth",
                     "inflation_expectations",
                     "oil_yoy",
-                ]
-                if c in data.columns
+                ] if c in data.columns
             ]
         ].dropna().to_dict(),
     }
