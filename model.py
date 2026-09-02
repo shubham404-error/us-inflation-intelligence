@@ -1,460 +1,485 @@
 from __future__ import annotations
 
-import os
-from datetime import datetime
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
-import altair as alt
+import numpy as np
 import pandas as pd
-import streamlit as st
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-from data import DATA_CUTOFF, build_dataset, data_quality, latest_metrics
-from model import FED_TARGET, build_forecast
-from ai import ask_gemini, default_brief
+try:
+    from xgboost import XGBRegressor
+except Exception:
+    XGBRegressor = None
 
 
-st.set_page_config(
-    page_title="US Inflation Intelligence",
-    page_icon="◎",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+TARGET = "pce_inflation"
+HORIZONS = (1, 3, 6)
+FED_TARGET = 2.0
 
-st.markdown(
-    """
-<style>
-:root {
-    --bg: #0a0d12;
-    --panel: #10151d;
-    --panel2: #0d1219;
-    --border: #26303d;
-    --text: #eef2f7;
-    --muted: #8b98a8;
-    --accent: #72e0b2;
-    --warn: #ffc857;
-    --danger: #ff7b7b;
-}
-.stApp {
-    background: var(--bg);
-    color: var(--text);
-}
-.block-container {
-    max-width: 1280px;
-    padding: 1rem 0.9rem 4rem 0.9rem;
-}
-[data-testid="stHeader"] {
-    background: rgba(10,13,18,0.92);
-}
-[data-testid="stMetric"] {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 0.8rem 0.9rem;
-}
-[data-testid="stMetricLabel"] {
-    color: var(--muted);
-}
-[data-testid="stMetricValue"] {
-    color: var(--text);
-}
-.terminal-title {
-    font-size: 1.22rem;
-    font-weight: 750;
-    letter-spacing: 0.03em;
-    margin: 0;
-}
-.terminal-subtitle {
-    color: var(--muted);
-    font-size: 0.82rem;
-    margin-top: 0.15rem;
-}
-.eyebrow {
-    color: var(--accent);
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    font-size: 0.68rem;
-    font-weight: 700;
-}
-.hero {
-    background: linear-gradient(145deg, #111821, #0d1218);
-    border: 1px solid var(--border);
-    border-radius: 18px;
-    padding: 1.1rem;
-    margin: 0.65rem 0 0.9rem 0;
-}
-.hero-value {
-    font-size: clamp(2.5rem, 8vw, 4.2rem);
-    line-height: 0.95;
-    font-weight: 800;
-    letter-spacing: -0.05em;
-}
-.hero-label {
-    color: var(--muted);
-    font-size: 0.82rem;
-    margin-top: 0.35rem;
-}
-.signal {
-    display: inline-block;
-    padding: 0.28rem 0.55rem;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    color: var(--accent);
-    font-size: 0.72rem;
-    margin-top: 0.7rem;
-}
-.card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 15px;
-    padding: 0.95rem;
-    margin-bottom: 0.8rem;
-}
-.card-title {
-    font-weight: 720;
-    font-size: 0.9rem;
-}
-.card-note {
-    color: var(--muted);
-    font-size: 0.77rem;
-    line-height: 1.45;
-    margin-top: 0.35rem;
-}
-.ai-box {
-    background: #0f1720;
-    border: 1px solid #344253;
-    border-radius: 16px;
-    padding: 0.95rem;
-}
-.footer {
-    color: #667385;
-    font-size: 0.7rem;
-    text-align: center;
-    padding-top: 1.3rem;
-}
-@media (max-width: 600px) {
-    .block-container {
-        padding: 0.65rem 0.65rem 3rem 0.65rem;
+BASE_FEATURES = [
+    TARGET,
+    "core_pce_inflation",
+    "shelter_inflation",
+    "unemployment",
+    "unemployment_change",
+    "consumption_growth",
+    "oil_yoy",
+    "oil_3m",
+    "inflation_expectations",
+    "expectations_change",
+]
+
+LAGS = (1, 2, 3, 6, 12)
+
+
+@dataclass
+class ForecastResult:
+    forecast: pd.DataFrame
+    metrics: pd.DataFrame
+    state: Dict
+    drivers: pd.DataFrame
+    history: pd.DataFrame
+    calibration: Dict
+    chat_context: Dict
+
+
+def _feature_frame(data: pd.DataFrame) -> pd.DataFrame:
+    x = pd.DataFrame(index=data.index)
+    for col in BASE_FEATURES:
+        if col not in data.columns:
+            continue
+        for lag in LAGS:
+            x[f"{col}_lag{lag}"] = data[col].shift(lag)
+    return x
+
+
+def _xgb_model() -> object:
+    if XGBRegressor is not None:
+        return XGBRegressor(
+            n_estimators=350,
+            max_depth=2,
+            learning_rate=0.025,
+            min_child_weight=4,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            reg_alpha=0.05,
+            reg_lambda=1.5,
+            objective="reg:squarederror",
+            tree_method="hist",
+            n_jobs=2,
+            random_state=42,
+        )
+    return HistGradientBoostingRegressor(
+        max_iter=250,
+        learning_rate=0.035,
+        max_leaf_nodes=8,
+        l2_regularization=1.0,
+        random_state=42,
+    )
+
+
+def _safe_sarimax(train: pd.Series, steps: int) -> Tuple[np.ndarray, np.ndarray]:
+    model = SARIMAX(
+        train,
+        order=(1, 0, 1),
+        seasonal_order=(1, 0, 1, 12),
+        trend="c",
+        enforce_stationarity=False,
+        enforce_invertibility=False,
+    )
+    fit = model.fit(disp=False)
+    pred = fit.get_forecast(steps=steps)
+    mean = np.asarray(pred.predicted_mean, dtype=float)
+    conf = np.asarray(pred.conf_int(alpha=0.20), dtype=float)
+    return mean, conf
+
+
+def _fit_direct_xgb(data: pd.DataFrame, horizon: int):
+    features = _feature_frame(data)
+    y = data[TARGET].shift(-horizon)
+    frame = pd.concat([features, y.rename("y")], axis=1).dropna()
+
+    model = _xgb_model()
+    model.fit(frame.drop(columns=["y"]), frame["y"])
+    return model, features
+
+
+def _walk_forward_xgb(data: pd.DataFrame, horizon: int, min_train: int = 96) -> pd.DataFrame:
+    features = _feature_frame(data)
+    target = data[TARGET]
+    rows = []
+
+    valid_dates = target.dropna().index
+
+    # Monthly rolling-origin evaluation. Keep the window modest enough for app runtime.
+    for i in range(min_train, len(valid_dates) - horizon + 1):
+        origin_date = valid_dates[i - 1]
+        forecast_date = valid_dates[i + horizon - 1]
+
+        train_mask = features.index <= origin_date
+        y_train = target.shift(-horizon)
+        fit = pd.concat([features.loc[train_mask], y_train.loc[train_mask].rename("y")], axis=1).dropna()
+
+        if len(fit) < 72:
+            continue
+
+        model = _xgb_model()
+        model.fit(fit.drop(columns=["y"]), fit["y"])
+
+        if forecast_date not in features.index:
+            continue
+
+        row = features.loc[[forecast_date]].dropna(axis=1, how="all")
+        common = [c for c in fit.drop(columns=["y"]).columns if c in row.columns]
+        row = row.reindex(columns=common)
+
+        if row.isna().any().any():
+            continue
+
+        pred = float(model.predict(row)[0])
+        actual = float(target.loc[forecast_date])
+
+        rows.append(
+            {
+                "origin": origin_date,
+                "date": forecast_date,
+                "actual": actual,
+                "pred": pred,
+                "error": actual - pred,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _walk_forward_sarimax(data: pd.DataFrame, horizon: int, min_train: int = 96) -> pd.DataFrame:
+    target = data[TARGET].dropna()
+    dates = target.index
+    rows = []
+
+    for i in range(min_train, len(dates) - horizon + 1):
+        train = target.iloc[:i]
+        forecast_date = dates[i + horizon - 1]
+
+        try:
+            model = SARIMAX(
+                train,
+                order=(1, 0, 1),
+                seasonal_order=(1, 0, 1, 12),
+                trend="c",
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            )
+            fit = model.fit(disp=False)
+            pred = float(fit.get_forecast(steps=horizon).predicted_mean.iloc[-1])
+        except Exception:
+            continue
+
+        rows.append(
+            {
+                "origin": dates[i - 1],
+                "date": forecast_date,
+                "actual": float(target.loc[forecast_date]),
+                "pred": pred,
+                "error": float(target.loc[forecast_date]) - pred,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _metrics(rows: pd.DataFrame, model_name: str, horizon: int) -> Dict:
+    if rows.empty:
+        return {
+            "model": model_name,
+            "horizon": horizon,
+            "MAE": np.nan,
+            "RMSE": np.nan,
+            "Bias": np.nan,
+            "n": 0,
+        }
+    return {
+        "model": model_name,
+        "horizon": horizon,
+        "MAE": float(mean_absolute_error(rows["actual"], rows["pred"])),
+        "RMSE": float(mean_squared_error(rows["actual"], rows["pred"]) ** 0.5),
+        "Bias": float((rows["pred"] - rows["actual"]).mean()),
+        "n": int(len(rows)),
     }
-    .hero {
-        padding: 0.95rem;
+
+
+def _direction(m: float) -> str:
+    if m <= -0.15:
+        return "Moderating"
+    if m >= 0.15:
+        return "Reaccelerating"
+    return "Stable"
+
+
+def _state(data: pd.DataFrame, forecast: pd.DataFrame) -> Dict:
+    target = data[TARGET].dropna()
+    current = float(target.iloc[-1])
+    m3 = float(target.tail(3).mean() - target.iloc[-4:-1].mean()) if len(target) >= 4 else 0.0
+    m6 = float(target.tail(6).mean() - target.iloc[-12:-6].mean()) if len(target) >= 12 else 0.0
+
+    if current > 3.5:
+        level = "Elevated"
+    elif current > 2.5:
+        level = "Above target"
+    else:
+        level = "Near target"
+
+    pressure = 50.0
+    pressure += np.clip((current - FED_TARGET) * 12, -20, 30)
+    pressure += np.clip(m3 * 18, -15, 15)
+
+    latest = data.iloc[-1]
+    if float(latest.get("core_pce_inflation", current)) > current:
+        pressure += 5
+    if float(latest.get("shelter_inflation", 0)) > 4:
+        pressure += 7
+    if float(latest.get("inflation_expectations", 0)) > 3:
+        pressure += 5
+    pressure = float(np.clip(pressure, 0, 100))
+
+    momentum = _direction(m3)
+
+    f6 = float(forecast.loc[forecast["horizon"] == 6, "point"].iloc[0])
+    gap = f6 - FED_TARGET
+    if f6 <= 2.5:
+        outlook = "Approaching target"
+    elif f6 < current - 0.15:
+        outlook = "Disinflation"
+    elif f6 > current + 0.15:
+        outlook = "Reacceleration"
+    else:
+        outlook = "Sticky"
+
+    confidence = "High" if pressure < 35 or pressure > 75 else "Medium"
+
+    return {
+        "current": current,
+        "level": level,
+        "momentum": momentum,
+        "momentum_3m": m3,
+        "momentum_6m": m6,
+        "outlook": outlook,
+        "forecast_6m": f6,
+        "gap_to_target": gap,
+        "pressure_score": pressure,
+        "confidence": confidence,
     }
-    .card {
-        padding: 0.8rem;
+
+
+def _driver_table(data: pd.DataFrame, model) -> pd.DataFrame:
+    features = _feature_frame(data)
+    cols = list(features.columns)
+    latest = features.dropna().iloc[[-1]]
+    latest = latest.reindex(columns=cols)
+
+    if hasattr(model, "feature_importances_"):
+        importance = np.asarray(model.feature_importances_, dtype=float)
+    else:
+        importance = np.zeros(len(cols))
+
+    grouped = {}
+    for col, imp in zip(cols, importance):
+        base = col.rsplit("_lag", 1)[0]
+        grouped[base] = grouped.get(base, 0.0) + float(imp)
+
+    labels = {
+        TARGET: "Inflation persistence",
+        "core_pce_inflation": "Core PCE",
+        "shelter_inflation": "Shelter inflation",
+        "unemployment": "Unemployment",
+        "unemployment_change": "Unemployment change",
+        "consumption_growth": "Real consumption growth",
+        "oil_yoy": "Oil",
+        "oil_3m": "Oil momentum",
+        "inflation_expectations": "Inflation expectations",
+        "expectations_change": "Expectations change",
     }
-}
-</style>
-""",
-    unsafe_allow_html=True,
-)
+
+    out = pd.DataFrame(
+        [
+            {"Driver": labels.get(k, k), "Importance": v}
+            for k, v in grouped.items()
+        ]
+    ).sort_values("Importance", ascending=False)
+
+    if out["Importance"].sum() > 0:
+        out["Importance"] = out["Importance"] / out["Importance"].sum()
+    return out.head(6).reset_index(drop=True)
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_data():
-    return build_dataset()
+def build_forecast(data: pd.DataFrame) -> ForecastResult:
+    data = data.copy()
+    target = data[TARGET].dropna()
 
+    # Walk-forward validation.
+    validation = {}
+    metric_rows = []
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_forecast(data: pd.DataFrame):
-    return build_forecast(data)
+    for h in HORIZONS:
+        xgb_eval = _walk_forward_xgb(data, h)
+        sarimax_eval = _walk_forward_sarimax(data, h)
 
+        validation[("XGBoost", h)] = xgb_eval
+        validation[("SARIMAX", h)] = sarimax_eval
+        metric_rows.append(_metrics(xgb_eval, "XGBoost", h))
+        metric_rows.append(_metrics(sarimax_eval, "SARIMAX", h))
 
-def fmt_pct(value) -> str:
-    return "—" if value is None or pd.isna(value) else f"{value:.1f}%"
+        naive_actual = target.iloc[h:]
+        naive_pred = target.iloc[:-h].values
+        n = min(len(naive_actual), len(naive_pred))
+        naive_rows = pd.DataFrame(
+            {
+                "actual": naive_actual.iloc[:n].values,
+                "pred": naive_pred[:n],
+            }
+        )
+        metric_rows.append(
+            {
+                "model": "Naive",
+                "horizon": h,
+                "MAE": float(mean_absolute_error(naive_rows["actual"], naive_rows["pred"])),
+                "RMSE": float(mean_squared_error(naive_rows["actual"], naive_rows["pred"]) ** 0.5),
+                "Bias": float((naive_rows["pred"] - naive_rows["actual"]).mean()),
+                "n": int(n),
+            }
+        )
 
+    metrics = pd.DataFrame(metric_rows)
 
-def plot_forecast(history: pd.DataFrame, forecast: pd.DataFrame):
-    hist = history[["date", "pce_inflation"]].tail(72).copy()
-    hist["type"] = "Actual"
+    # Final models fitted on all available data.
+    predictions = []
+    final_xgb_by_h = {}
+    for h in HORIZONS:
+        model, features = _fit_direct_xgb(data, h)
+        final_xgb_by_h[h] = model
+        row = features.dropna().iloc[[-1]]
+        pred = float(model.predict(row)[0])
+        predictions.append({"horizon": h, "xgb": pred})
 
-    future = pd.DataFrame(
+    # SARIMAX 6M path, used as an econometric challenger.
+    sarimax_mean, sarimax_conf = _safe_sarimax(target, 6)
+
+    # Select / blend using 3M validation.
+    xgb_3 = validation[("XGBoost", 3)]
+    sar_3 = validation[("SARIMAX", 3)]
+    xgb_mae = _metrics(xgb_3, "XGBoost", 3)["MAE"]
+    sar_mae = _metrics(sar_3, "SARIMAX", 3)["MAE"]
+
+    if not np.isfinite(xgb_mae):
+        weights = {"XGBoost": 0.0, "SARIMAX": 1.0}
+    elif not np.isfinite(sar_mae):
+        weights = {"XGBoost": 1.0, "SARIMAX": 0.0}
+    elif abs(xgb_mae - sar_mae) < 0.10:
+        weights = {"XGBoost": 0.5, "SARIMAX": 0.5}
+    elif xgb_mae < sar_mae:
+        weights = {"XGBoost": 0.65, "SARIMAX": 0.35}
+    else:
+        weights = {"XGBoost": 0.35, "SARIMAX": 0.65}
+
+    xgb_path = []
+    for h in range(1, 7):
+        model, features = _fit_direct_xgb(data, h)
+        row = features.dropna().iloc[[-1]]
+        xgb_path.append(float(model.predict(row)[0]))
+
+    ensemble = []
+    for h in range(1, 7):
+        value = weights["XGBoost"] * xgb_path[h - 1]
+        value += weights["SARIMAX"] * sarimax_mean[h - 1]
+        ensemble.append(value)
+
+    # Prediction intervals calibrated from 3M XGB walk-forward absolute residuals.
+    residuals = np.abs(xgb_3["error"].values) if not xgb_3.empty else np.array([0.4])
+    q80 = float(np.quantile(residuals, 0.80))
+    lower = []
+    upper = []
+    for h, point in enumerate(ensemble, start=1):
+        radius = q80 * np.sqrt(h / 3)
+        lower.append(point - radius)
+        upper.append(point + radius)
+
+    forecast = pd.DataFrame(
         {
-            "date": pd.date_range(
-                start=hist["date"].max() + pd.offsets.MonthEnd(1),
-                periods=len(forecast),
-                freq="ME",
-            ),
-            "pce_inflation": forecast["point"].values,
-            "lower_80": forecast["lower_80"].values,
-            "upper_80": forecast["upper_80"].values,
-            "type": "Forecast",
+            "horizon": np.arange(1, 7),
+            "point": ensemble,
+            "lower_80": lower,
+            "upper_80": upper,
         }
     )
 
-    chart_base = alt.Chart(future).encode(
-        x=alt.X("date:T", title=None, axis=alt.Axis(format="%b %Y")),
-    )
+    # Driver ranking from 3M XGB.
+    drivers = _driver_table(data, final_xgb_by_h[3])
 
-    band = chart_base.mark_area(opacity=0.18).encode(
-        y=alt.Y("lower_80:Q", title="PCE inflation (%)"),
-        y2="upper_80:Q",
-    )
-
-    forecast_line = chart_base.mark_line(strokeWidth=3).encode(
-        y="pce_inflation:Q",
-        tooltip=[
-            alt.Tooltip("date:T", title="Date"),
-            alt.Tooltip("pce_inflation:Q", title="Forecast", format=".2f"),
-            alt.Tooltip("lower_80:Q", title="80% low", format=".2f"),
-            alt.Tooltip("upper_80:Q", title="80% high", format=".2f"),
+    # Regime-like history based on transparent rolling momentum, not HMM.
+    hist = data[[TARGET]].dropna().copy()
+    hist["momentum_3m"] = hist[TARGET].rolling(3).mean().diff(3)
+    hist["state"] = np.select(
+        [
+            hist["momentum_3m"] <= -0.15,
+            hist["momentum_3m"] >= 0.15,
         ],
-    )
-
-    actual_line = alt.Chart(hist).mark_line(strokeWidth=2).encode(
-        x=alt.X("date:T", title=None),
-        y=alt.Y("pce_inflation:Q", title="PCE inflation (%)"),
-        tooltip=[
-            alt.Tooltip("date:T", title="Date"),
-            alt.Tooltip("pce_inflation:Q", title="Actual", format=".2f"),
+        [
+            "Moderating",
+            "Reaccelerating",
         ],
+        default="Stable",
     )
+    hist = hist.reset_index(names="date")
 
-    target = alt.Chart(
-        pd.DataFrame({"target": [FED_TARGET]})
-    ).mark_rule(strokeDash=[6, 4]).encode(y="target:Q")
+    state = _state(data, forecast)
+    state["weights"] = weights
 
-    return (actual_line + band + forecast_line + target).properties(height=320)
-
-
-def render_header(state):
-    st.markdown(
-        f"""
-        <div>
-          <div class="terminal-title">US INFLATION INTELLIGENCE</div>
-          <div class="terminal-subtitle">PCE-focused inflation forecasting and plain-English macro analysis · cutoff {DATA_CUTOFF}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    # Empirical 80% interval coverage on the available 3M XGB walk-forward sample.
+    coverage = (
+        float((np.abs(xgb_3["error"]) <= q80).mean()) if not xgb_3.empty else np.nan
     )
+    calibration = {
+        "target": 0.80,
+        "empirical_coverage": coverage,
+        "radius": q80,
+        "n": int(len(xgb_3)),
+    }
 
-    page = st.segmented_control(
-        "Navigate",
-        ["Overview", "Forecast", "Drivers", "AI", "Data"],
-        default="Overview",
-        label_visibility="collapsed",
-        key="page",
+    latest_date = data.dropna(subset=[TARGET]).index[-1].date().isoformat()
+
+    chat_context = {
+        "latest_data_date": latest_date,
+        "fed_target": FED_TARGET,
+        "state": state,
+        "forecast": forecast.to_dict("records"),
+        "drivers": drivers.to_dict("records"),
+        "validation": metrics.to_dict("records"),
+        "calibration": calibration,
+        "latest": data.iloc[-1][
+            [
+                c
+                for c in [
+                    "core_pce_inflation",
+                    "shelter_inflation",
+                    "unemployment",
+                    "consumption_growth",
+                    "inflation_expectations",
+                    "oil_yoy",
+                ]
+                if c in data.columns
+            ]
+        ].dropna().to_dict(),
+    }
+
+    return ForecastResult(
+        forecast=forecast,
+        metrics=metrics,
+        state=state,
+        drivers=drivers,
+        history=hist,
+        calibration=calibration,
+        chat_context=chat_context,
     )
-    return page or "Overview"
-
-
-def render_overview(data, result):
-    state = result.state
-    latest = latest_metrics(data)
-
-    st.markdown(
-        f"""
-        <div class="hero">
-          <div class="eyebrow">Current inflation state</div>
-          <div class="hero-value">{latest["pce"]:.1f}%</div>
-          <div class="hero-label">PCE year-over-year inflation · Latest available observation</div>
-          <div class="signal">{state["level"].upper()} · {state["momentum"].upper()}</div>
-          <div class="card-note">{default_brief(result.chat_context)}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Core PCE", fmt_pct(latest["core_pce"]))
-    c2.metric("Fed target", "2.0%")
-    c3.metric("6M outlook", fmt_pct(state["forecast_6m"]))
-
-    st.markdown("### Inflation path")
-    st.altair_chart(
-        plot_forecast(result.history, result.forecast),
-        use_container_width=True,
-    )
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown(
-            f"""
-            <div class="card">
-              <div class="card-title">What matters now</div>
-              <div class="card-note">
-                <b>State:</b> {state["level"]}<br>
-                <b>Momentum:</b> {state["momentum"]}<br>
-                <b>Outlook:</b> {state["outlook"]}<br>
-                <b>Pressure:</b> {state["pressure_score"]:.0f}/100<br>
-                <b>Confidence:</b> {state["confidence"]}
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with c2:
-        st.markdown(
-            """
-            <div class="card">
-              <div class="card-title">Ask Inflation AI</div>
-              <div class="card-note">
-                Ask why inflation is high, whether it is moving toward 2%, what is driving
-                the forecast, or what could make the outlook wrong.
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("Open AI assistant", use_container_width=True):
-            st.session_state["page"] = "AI"
-            st.rerun()
-
-
-def render_forecast(result):
-    st.markdown("### Forecast")
-    st.caption(
-        "Six-month path from the final ensemble. Intervals are calibrated from historical walk-forward forecast errors."
-    )
-
-    display = result.forecast.copy()
-    display["horizon"] = display["horizon"].map(lambda x: f"{x}M")
-    display["point"] = display["point"].map(lambda x: f"{x:.2f}%")
-    display["lower_80"] = display["lower_80"].map(lambda x: f"{x:.2f}%")
-    display["upper_80"] = display["upper_80"].map(lambda x: f"{x:.2f}%")
-    display.columns = ["Horizon", "Forecast", "80% Low", "80% High"]
-    st.dataframe(display, use_container_width=True, hide_index=True)
-
-    st.markdown("### Model validation")
-    metrics = result.metrics.copy()
-    metrics["MAE"] = metrics["MAE"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "—")
-    metrics["RMSE"] = metrics["RMSE"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "—")
-    metrics["Bias"] = metrics["Bias"].map(lambda x: f"{x:+.3f}" if pd.notna(x) else "—")
-    st.dataframe(metrics, use_container_width=True, hide_index=True)
-
-    cal = result.calibration
-    coverage = cal["empirical_coverage"]
-    st.info(
-        f"80% conformal target coverage: {coverage:.1%} on {cal['n']} walk-forward 3M forecasts. "
-        f"Calibration radius: {cal['radius']:.2f} percentage points."
-        if pd.notna(coverage)
-        else "Not enough walk-forward forecasts for coverage diagnostics."
-    )
-
-
-def render_drivers(result):
-    st.markdown("### What is driving the forecast?")
-    st.caption(
-        "Importance is a model signal, not proof of economic causation. It reflects the features the 3M XGBoost model relied on most."
-    )
-
-    drivers = result.drivers.copy()
-    drivers["Importance %"] = drivers["Importance"] * 100
-    st.bar_chart(drivers.set_index("Driver")["Importance %"], height=280)
-
-    st.dataframe(
-        drivers.assign(
-            Importance=drivers["Importance"].map(lambda x: f"{x:.1%}"),
-        )[["Driver", "Importance"]],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.markdown("### Market state")
-    state = result.state
-    a, b, c = st.columns(3)
-    a.metric("Pressure", f'{state["pressure_score"]:.0f}/100')
-    b.metric("Momentum", state["momentum"])
-    c.metric("Outlook", state["outlook"])
-
-
-def render_ai(result):
-    st.markdown("### Ask Inflation AI")
-    st.caption("Gemini 3.5 Flash. Grounded in the current application data and forecast.")
-
-    suggestions = [
-        "Why is inflation still above 2%?",
-        "Will inflation reach 2% in the next six months?",
-        "What is driving inflation right now?",
-        "Explain the forecast like I am not an economist.",
-    ]
-
-    for q in suggestions:
-        if st.button(q, use_container_width=True):
-            st.session_state["pending_question"] = q
-
-    if "ai_messages" not in st.session_state:
-        st.session_state["ai_messages"] = []
-
-    for message in st.session_state["ai_messages"]:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    question = st.chat_input("Ask about U.S. inflation...")
-    pending = st.session_state.pop("pending_question", None)
-    question = question or pending
-
-    if question:
-        st.session_state["ai_messages"].append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.markdown(question)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Analyzing the latest model state..."):
-                try:
-                    answer = ask_gemini(
-                        question,
-                        result.chat_context,
-                        st.session_state["ai_messages"][-7:],
-                    )
-                except Exception as exc:
-                    answer = (
-                        f"AI assistant is unavailable right now. {exc}"
-                        if st.secrets.get("ENVIRONMENT", "local") != "production"
-                        else "AI assistant is temporarily unavailable. Please check the Gemini API configuration."
-                    )
-                st.markdown(answer)
-
-        st.session_state["ai_messages"].append(
-            {"role": "assistant", "content": answer}
-        )
-
-
-def render_data(data, status):
-    st.markdown("### Data")
-    st.caption(
-        "All model inputs are pulled through FRED. Underlying source-of-record labels are retained in the metadata table."
-    )
-    st.dataframe(status, use_container_width=True, hide_index=True)
-
-    st.markdown("### Quality checks")
-    st.dataframe(data_quality(data), use_container_width=True, hide_index=True)
-
-    csv = data.reset_index().to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download processed data",
-        csv,
-        "us_inflation_intelligence_data.csv",
-        "text/csv",
-        use_container_width=True,
-    )
-
-
-def main():
-    try:
-        bundle = load_data()
-        data = bundle.data
-        status = bundle.status
-        result = load_forecast(data)
-    except Exception as exc:
-        st.error(str(exc))
-        st.stop()
-
-    page = render_header(result.state)
-
-    if page == "Overview":
-        render_overview(data, result)
-    elif page == "Forecast":
-        render_forecast(result)
-    elif page == "Drivers":
-        render_drivers(result)
-    elif page == "AI":
-        render_ai(result)
-    else:
-        render_data(data, status)
-
-    st.markdown(
-        '<div class="footer">US Inflation Intelligence · Built for research, explanation, and disciplined forecasting</div>',
-        unsafe_allow_html=True,
-    )
-
-
-if __name__ == "__main__":
-    main()
