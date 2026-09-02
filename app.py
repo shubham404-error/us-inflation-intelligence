@@ -615,14 +615,81 @@ if st.session_state["page"] == "Overview":
             unsafe_allow_html=True,
         )
 
-        w = forecasts["ensemble_weights"]
+# ========================================================
+# MODEL MIX
+# ========================================================
 
-        st.write(
-            f"XGBoost  **{w['XGBoost']:.0%}**"
+metrics = forecasts.get("metrics", {})
+
+if "ensemble_weights" in forecasts:
+
+    w = forecasts["ensemble_weights"]
+
+    xgb_weight = float(
+        w.get("XGBoost", 0.50)
+    )
+
+    sarimax_weight = float(
+        w.get("SARIMAX", 0.50)
+    )
+
+else:
+    # Fallback for older model.py versions.
+    # Calculate weights from validation MAE.
+    try:
+        xgb_mae = float(
+            metrics["XGBoost"]["MAE"]
         )
-        st.write(
-            f"SARIMAX  **{w['SARIMAX']:.0%}**"
+
+        sarimax_mae = float(
+            metrics["SARIMAX"]["MAE"]
         )
+
+        inv_xgb = 1 / max(
+            xgb_mae,
+            1e-6
+        )
+
+        inv_sarimax = 1 / max(
+            sarimax_mae,
+            1e-6
+        )
+
+        xgb_weight = (
+            inv_xgb
+            / (
+                inv_xgb
+                + inv_sarimax
+            )
+        )
+
+        sarimax_weight = (
+            1
+            - xgb_weight
+        )
+
+        # If models are essentially tied,
+        # keep the ensemble balanced.
+        if abs(
+            xgb_mae
+            - sarimax_mae
+        ) < 0.02:
+
+            xgb_weight = 0.50
+            sarimax_weight = 0.50
+
+    except Exception:
+        xgb_weight = 0.50
+        sarimax_weight = 0.50
+
+
+st.write(
+    f"XGBoost  **{xgb_weight:.0%}**"
+)
+
+st.write(
+    f"SARIMAX  **{sarimax_weight:.0%}**"
+)
 
     st.markdown(
         '<div class="section-label">RESEARCH VIEW</div>',
