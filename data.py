@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from io import StringIO
 from typing import Final
 
 import numpy as np
@@ -16,80 +14,71 @@ START_DATE: Final[str] = "2000-01-01"
 DATA_CUTOFF: Final[str] = "2026-08-31"
 FRED_URL: Final[str] = "https://api.stlouisfed.org/fred/series/observations"
 
-# Small, deliberate model universe.
+# Deliberately small, economically motivated variable universe.
 SERIES = {
     "pcepi": {
         "id": "PCEPI",
         "name": "PCE Price Index",
         "source": "BEA",
         "frequency": "Monthly",
-        "type": "index",
     },
     "core_pce": {
         "id": "PCEPILFE",
         "name": "Core PCE Price Index",
         "source": "BEA",
         "frequency": "Monthly",
-        "type": "index",
     },
     "shelter": {
         "id": "CUSR0000SAH1",
         "name": "CPI Shelter",
         "source": "BLS",
         "frequency": "Monthly",
-        "type": "index",
     },
     "unemployment": {
         "id": "UNRATE",
         "name": "Unemployment Rate",
         "source": "BLS",
         "frequency": "Monthly",
-        "type": "level",
     },
     "real_consumption": {
         "id": "DPCERA3M086SBEA",
         "name": "Real Personal Consumption Expenditures",
         "source": "BEA",
         "frequency": "Monthly",
-        "type": "index",
     },
     "inflation_expectations": {
         "id": "MICH",
-        "name": "University of Michigan 1-Year Inflation Expectation",
+        "name": "1-Year Inflation Expectations",
         "source": "University of Michigan",
         "frequency": "Monthly",
-        "type": "level",
     },
     "oil": {
         "id": "WTISPLC",
         "name": "WTI Crude Oil Price",
-        "source": "EIA / FRED splice",
+        "source": "EIA / FRED",
         "frequency": "Monthly",
-        "type": "level",
     },
 }
 
 
-@dataclass(frozen=True)
-class FredSeries:
-    key: str
-    series_id: str
-    name: str
-    source: str
-    frequency: str
-    series_type: str
-
-
-def _get_api_key() -> str:
+def _api_key() -> str:
     key = os.getenv("FRED_API_KEY", "").strip()
     if not key:
-        raise RuntimeError("FRED_API_KEY is not set.")
+        raise RuntimeError(
+            "FRED_API_KEY is missing. Add it to Streamlit Secrets or .env."
+        )
     return key
+
+
+def _monthly_last(series: pd.Series) -> pd.Series:
+    out = series.copy()
+    out.index = out.index.to_period("M").to_timestamp()
+    return out.groupby(level=0).last()
 
 
 def fetch_series(series_id: str) -> pd.Series:
     params = {
-        "api_key": _get_api_key(),
+        "api_key": _api_key(),
         "file_type": "json",
         "series_id": series_id,
         "observation_start": START_DATE,
@@ -97,66 +86,132 @@ def fetch_series(series_id: str) -> pd.Series:
         "realtime_start": DATA_CUTOFF,
         "realtime_end": DATA_CUTOFF,
     }
-    response = requests.get(FRED_URL, params=params, timeout=30)
+
+    response = requests.get(
+        FRED_URL,
+        params=params,
+        timeout=30,
+    )
     response.raise_for_status()
+
     payload = response.json()
+
+    if "error_code" in payload:
+        raise RuntimeError(
+            f"FRED error {payload['error_code']}: "
+            f"{payload.get('error_message', 'Unknown error')}"
+        )
 
     observations = payload.get("observations", [])
     if not observations:
-        raise RuntimeError(f"No observations returned for {series_id}.")
+        raise RuntimeError(
+            f"No observations returned for FRED series {series_id}."
+        )
 
-    df = pd.DataFrame(observations)
-    df["date"] = pd.to_datetime(df["date"])
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df = df.dropna(subset=["value"]).set_index("date").sort_index()
+    frame = pd.DataFrame(observations)
+    frame["date"] = pd.to_datetime(
+        frame["date"],
+        errors="coerce",
+    )
+    frame["value"] = pd.to_numeric(
+        frame["value"],
+        errors="coerce",
+    )
 
-    return df["value"].rename(series_id)
+    frame = (
+        frame.dropna(
+            subset=["date", "value"]
+        )
+        .set_index("date")
+        .sort_index()
+    )
+
+    frame = frame[
+        ~frame.index.duplicated(
+            keep="last"
+        )
+    ]
+
+    return frame["value"]
 
 
 def fetch_model_data() -> pd.DataFrame:
-    series_map = {}
+    data = {}
+
     for key, cfg in SERIES.items():
-        series_map[key] = fetch_series(cfg["id"])
+        data[key] = _monthly_last(
+            fetch_series(cfg["id"])
+        )
 
-    df = pd.concat(series_map, axis=1)
-    df.index = pd.DatetimeIndex(df.index).to_period("M").to_timestamp()
+    df = pd.concat(
+        data,
+        axis=1,
+    ).sort_index()
 
-    # Derived target and economically meaningful transformations.
-    df["pce_inflation"] = df["pcepi"].pct_change(12) * 100
-    df["core_pce_inflation"] = df["core_pce"].pct_change(12) * 100
-    df["shelter_inflation"] = df["shelter"].pct_change(12) * 100
-    df["consumption_growth"] = df["real_consumption"].pct_change(12) * 100
+    # Target.
+    df["pce_inflation"] = (
+        df["pcepi"]
+        .pct_change(12)
+        * 100
+    )
 
-    df["oil_yoy"] = df["oil"].pct_change(12) * 100
-    df["oil_3m"] = df["oil"].pct_change(3) * 100
-    df["expectations_change"] = df["inflation_expectations"].diff(3)
-    df["unemployment_change"] = df["unemployment"].diff(3)
+    # Core and shelter inflation.
+    df["core_pce_inflation"] = (
+        df["core_pce"]
+        .pct_change(12)
+        * 100
+    )
+
+    df["shelter_inflation"] = (
+        df["shelter"]
+        .pct_change(12)
+        * 100
+    )
+
+    # Demand.
+    df["consumption_growth"] = (
+        df["real_consumption"]
+        .pct_change(12)
+        * 100
+    )
+
+    # Energy.
+    df["oil_yoy"] = (
+        df["oil"]
+        .pct_change(12)
+        * 100
+    )
+
+    df["oil_3m"] = (
+        df["oil"]
+        .pct_change(3)
+        * 100
+    )
+
+    # Expectations and labour momentum.
+    df["expectations_change"] = (
+        df["inflation_expectations"]
+        .diff(3)
+    )
+
+    df["unemployment_change"] = (
+        df["unemployment"]
+        .diff(3)
+    )
 
     df = df.loc[
-        (df.index >= pd.Timestamp(START_DATE))
-        & (df.index <= pd.Timestamp(DATA_CUTOFF))
+        pd.Timestamp(START_DATE):
+        pd.Timestamp(DATA_CUTOFF)
     ].copy()
 
     return df
 
 
-def latest_snapshot(data: pd.DataFrame) -> dict:
-    target = data.dropna(subset=["pce_inflation"]).copy()
-    if target.empty:
-        raise RuntimeError("No usable PCE inflation observations.")
-
-    last = target.iloc[-1]
-    last_date = target.index[-1]
-
+def latest_status(data: pd.DataFrame) -> pd.DataFrame:
     rows = []
+
     for key, cfg in SERIES.items():
-        series = data[cfg["id"]].dropna()
-        if series.empty:
-            latest_date = "N/A"
-            latest_value = np.nan
-        else:
-            latest_date = series.index[-1].strftime("%Y-%m")
-            latest_value = series.iloc[-1]
+        series = data[key].dropna()
 
         rows.append(
             {
@@ -164,16 +219,12 @@ def latest_snapshot(data: pd.DataFrame) -> dict:
                 "FRED ID": cfg["id"],
                 "Source": cfg["source"],
                 "Frequency": cfg["frequency"],
-                "Latest observation": latest_date,
-                "Latest value": latest_value,
+                "Latest": (
+                    series.index[-1].strftime("%Y-%m")
+                    if not series.empty
+                    else "N/A"
+                ),
             }
         )
 
-    return {
-        "pce_inflation": float(last["pce_inflation"]),
-        "core_pce": float(last["core_pce_inflation"]),
-        "unemployment": float(last["unemployment"]),
-        "oil": float(last["oil"]),
-        "latest_pce_date": last_date.strftime("%Y-%m"),
-        "series_status": pd.DataFrame(rows),
-    }
+    return pd.DataFrame(rows)
