@@ -148,6 +148,16 @@ def fetch_model_data() -> pd.DataFrame:
         axis=1,
     ).sort_index()
 
+    # A single missing month in one series (e.g. a delayed BLS
+    # release during a shutdown) otherwise poisons every lagged
+    # feature derived from it for up to 12 months downstream,
+    # silently truncating the model to stale data. Carry the last
+    # known reading forward for genuinely isolated one-month gaps
+    # only -- a longer gap is left as NaN rather than fabricated.
+    df[list(SERIES.keys())] = (
+        df[list(SERIES.keys())].ffill(limit=1)
+    )
+
     # Target.
     df["pce_inflation"] = (
         df["pcepi"]
