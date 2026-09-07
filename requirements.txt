@@ -7,3 +7,4 @@ plotly
 scikit-learn
 statsmodels
 xgboost
+shap

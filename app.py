@@ -14,6 +14,7 @@ from data import (
 from model import (
     build_forecasts,
     driver_table,
+    local_driver_table,
     model_diagnostics,
 )
 
@@ -618,6 +619,9 @@ if st.session_state["page"] == "Overview":
         w = forecasts["ensemble_weights"]
 
         st.write(
+            f"Naive  **{w['Naive']:.0%}**"
+        )
+        st.write(
             f"XGBoost  **{w['XGBoost']:.0%}**"
         )
         st.write(
@@ -751,7 +755,7 @@ elif st.session_state["page"] == "Drivers":
 
     st.markdown(
         '<div class="page-subtitle">'
-        "Feature importance from the primary 3-month XGBoost model."
+        "SHAP model contributions from the primary 3-month XGBoost model."
         '</div>',
         unsafe_allow_html=True,
     )
@@ -767,7 +771,7 @@ elif st.session_state["page"] == "Drivers":
     with left:
 
         st.markdown(
-            '<div class="section-label">MODEL IMPORTANCE</div>',
+            '<div class="section-label">GLOBAL SHAP IMPORTANCE</div>',
             unsafe_allow_html=True,
         )
 
@@ -780,12 +784,12 @@ elif st.session_state["page"] == "Drivers":
         if not drivers.empty:
 
             plot = drivers.sort_values(
-                "Importance"
+                "Mean |SHAP|"
             )
 
             fig = go.Figure(
                 go.Bar(
-                    x=plot["Importance"],
+                    x=plot["Mean |SHAP|"],
                     y=plot["Driver"],
                     orientation="h",
                     marker_color="#55a7ff",
@@ -806,7 +810,7 @@ elif st.session_state["page"] == "Drivers":
                     color="#cbd4de"
                 ),
                 xaxis=dict(
-                    title="Relative model importance",
+                    title="Mean |SHAP value|, in pp of predicted change",
                     gridcolor="#1c2530",
                 ),
                 yaxis=dict(
@@ -891,6 +895,86 @@ elif st.session_state["page"] == "Drivers":
 
         st.caption(
             "Driver importance is model-based and does not establish economic causality."
+        )
+
+    st.markdown(
+        '<div class="section-label">WHY THIS FORECAST, SPECIFICALLY</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="page-subtitle">'
+        "Local SHAP contributions for the current 3-month forecast — "
+        "which inputs are pushing it up or down right now, and by how much."
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    local_drivers = local_driver_table(
+        forecasts
+    )
+
+    if not local_drivers.empty:
+
+        plot = local_drivers.sort_values(
+            "Contribution (pp)"
+        )
+
+        colors = [
+            "#f3b340" if v > 0 else "#55a7ff"
+            for v in plot["Contribution (pp)"]
+        ]
+
+        fig = go.Figure(
+            go.Bar(
+                x=plot["Contribution (pp)"],
+                y=plot["Driver"],
+                orientation="h",
+                marker_color=colors,
+            )
+        )
+
+        fig.add_vline(
+            x=0,
+            line_color="#454f5c",
+        )
+
+        fig.update_layout(
+            height=340,
+            margin=dict(
+                l=5,
+                r=5,
+                t=5,
+                b=5,
+            ),
+            paper_bgcolor="#0b0f14",
+            plot_bgcolor="#0b0f14",
+            font=dict(
+                color="#cbd4de"
+            ),
+            xaxis=dict(
+                title="SHAP contribution, in pp of predicted change",
+                gridcolor="#1c2530",
+            ),
+            yaxis=dict(
+                showgrid=False
+            ),
+        )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+        )
+
+        st.dataframe(
+            local_drivers,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "Orange pushes the 3-month forecast up, blue pushes it down. "
+            "These are model attributions, not causal effects."
         )
 
 
